@@ -18,6 +18,9 @@ settings:
     CODE_SIGN_STYLE: Automatic
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     DEAD_CODE_STRIPPING: YES
+    # the Rust xcframework has arm64 simulator slices only (Apple silicon Macs)
+    "EXCLUDED_ARCHS[sdk=appletvsimulator*]": x86_64
+    "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
 
 packages:
   MPVKit:
@@ -50,6 +53,7 @@ targets:
         type: folder
       - path: App/Generated/marks
         type: folder
+      - path: App/Generated/Flags.xcassets
     dependencies:
       - package: MPVKit
         product: MPVKit
@@ -63,6 +67,9 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: App/Info.plist
+        # the Rust staticlib doesn't carry its #[link] frameworks into the app link (chrono's
+        # iana-time-zone reads the zone through CFTimeZone)
+        OTHER_LDFLAGS: ["$(inherited)", "-framework", "CoreFoundation"]
       configs:
         Debug:
           SWIFT_ACTIVE_COMPILATION_CONDITIONS: ["DEBUG"]
@@ -131,6 +138,7 @@ targets:
         type: folder
       - path: App/Generated/marks
         type: folder
+      - path: App/Generated/Flags.xcassets
     dependencies:
       - package: MPVKit
         product: MPVKit
@@ -146,6 +154,9 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: iPhone/Info.plist
+        # the Rust staticlib doesn't carry its #[link] frameworks into the app link (chrono's
+        # iana-time-zone reads the zone through CFTimeZone)
+        OTHER_LDFLAGS: ["$(inherited)", "-framework", "CoreFoundation"]
       configs:
         Debug:
           SWIFT_ACTIVE_COMPILATION_CONDITIONS: ["DEBUG"]
@@ -185,6 +196,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: "${HARBOR_BUNDLE_ID}.ios.tests"
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Harbor.app/Harbor"
+        # @testable import HarborPhone needs Libmpv visible; use the app's build products, don't link MPVKit twice
+        FRAMEWORK_SEARCH_PATHS: ["$(inherited)", "$(BUILT_PRODUCTS_DIR)", "$(BUILT_PRODUCTS_DIR)/PackageFrameworks"]
         BUNDLE_LOADER: "$(TEST_HOST)"
 
   HarborPhoneUITests:

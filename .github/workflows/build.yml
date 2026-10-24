@@ -95,6 +95,7 @@ jobs:
       - name: Engine + upstream assets
         run: scripts/prepare.sh
       - name: Generate project
+        id: generate
         run: scripts/generate.sh
       - uses: actions/cache@v4
         with:
@@ -109,6 +110,8 @@ jobs:
             || { grep -E "error:" tv.log | sort -u | head -80; tail -40 tv.log; exit 1; }
           grep -c "warning:" tv.log | xargs echo "warnings:"
       - name: Build iPhone (simulator)
+        # also when the Apple TV build failed, so one run reports both apps' errors
+        if: ${{ !cancelled() && steps.generate.outcome == 'success' }}
         run: |
           set -o pipefail
           xcodebuild -project Harbor.xcodeproj -scheme HarborPhone -configuration Debug \
