@@ -219,6 +219,12 @@ jobs:
             DEVELOPMENT_TEAM="$HARBOR_TEAM_ID" CODE_SIGNING_ALLOWED=NO \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" archive > archive.log 2>&1 \
             || { grep -E "error:" archive.log | sort -u | head -60; tail -40 archive.log; exit 1; }
+          # The embedded MPVKit frameworks keep their vendor's signature in an unsigned archive; the export would
+          # re-sign them but keep the vendor's code requirement, which App Store validation then rejects. Strip
+          # it so the export signs them from scratch.
+          for f in "$RUNNER_TEMP"/app.xcarchive/Products/Applications/*.app/Frameworks/*.framework; do
+            codesign --remove-signature "$f"
+          done
       - name: Upload to TestFlight
         if: steps.keys.outputs.ready == 'true'
         run: |
