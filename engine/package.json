@@ -1,0 +1,20 @@
+{
+  "name": "harbor-engine",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:min": "node build.mjs --min",
+    "test": "node build.mjs && node test/shims.test.mjs && node smoke.mjs",
+    "probe": "node test/probe.mjs"
+  },
+  "dependencies": {
+    "core-js": "^3.50.0",
+    "fflate": "^0.8.3",
+    "parse-torrent-title": "^3.0.1",
+    "tldts": "^7.4.12"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

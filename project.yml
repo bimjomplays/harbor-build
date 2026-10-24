@@ -1,0 +1,223 @@
+# XcodeGen spec. Generate with scripts/generate.sh (it sets the ids below); the .xcodeproj is not committed.
+#   HARBOR_BUNDLE_ID  the Apple TV app's bundle id; the iPhone app is "<id>.ios"
+#   HARBOR_TEAM_ID    the Apple developer team (empty for unsigned builds)
+name: Harbor
+options:
+  deploymentTarget:
+    tvOS: "17.0"
+    iOS: "26.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: false
+settings:
+  base:
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    DEVELOPMENT_TEAM: "${HARBOR_TEAM_ID}"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+
+packages:
+  MPVKit:
+    url: https://github.com/mpvkit/MPVKit
+    exactVersion: 1.1.0-n9.0.2
+
+targets:
+  Harbor:
+    type: application
+    platform: tvOS
+    sources:
+      - path: App/Sources
+      - path: App/Shared
+      - path: App/Assets.xcassets
+      - path: App/Fonts
+        buildPhase: resources
+      - path: App/Phone/harbor-phone.html
+        buildPhase: resources
+      - path: App/Generated/Engine/harbor-engine.js
+        buildPhase: resources
+      - path: App/Generated/awards.json
+        buildPhase: resources
+      - path: App/Generated/Locales
+        buildPhase: resources
+      - path: App/Generated/kids
+        type: folder
+      - path: App/Generated/avatars
+        type: folder
+      - path: App/Generated/badges
+        type: folder
+      - path: App/Generated/marks
+        type: folder
+    dependencies:
+      - package: MPVKit
+        product: MPVKit
+      - framework: rust/out/HarborFFI.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "${HARBOR_BUNDLE_ID}"
+        PRODUCT_NAME: Harbor
+        TARGETED_DEVICE_FAMILY: "3"
+        ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: App/Info.plist
+      configs:
+        Debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: ["DEBUG"]
+    info:
+      path: App/Info.plist
+      properties: &tvInfo
+        CFBundleDisplayName: Harbor
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        HarborBaseID: "${HARBOR_BUNDLE_ID}"
+        ITSAppUsesNonExemptEncryption: false
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities: [arm64]
+        UIUserInterfaceStyle: Automatic
+        UIAppFonts: &fonts
+          - Switzer-Regular.otf
+          - Switzer-Medium.otf
+          - Switzer-Semibold.otf
+          - Switzer-Bold.otf
+          - Sentient-Regular.otf
+          - Sentient-Medium.otf
+          - Sentient-Bold.otf
+          - Fraunces-Medium.ttf
+        CFBundleURLTypes: &urlTypes
+          - CFBundleURLName: harbor
+            CFBundleURLSchemes: [harbor, stremio]
+        # Streams, addons and home servers are plain http on the LAN and the internet.
+        NSAppTransportSecurity: &ats
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: Harbor uses your local network to link your phone and to play from home media servers.
+        CFBundleLocalizations: &langs [en, ar, de, es, fr, hi, id, it, ja, ko, pl, pt, ru, tr, vi, zh]
+
+  HarborUITests:
+    type: bundle.ui-testing
+    platform: tvOS
+    sources: [App/UITests]
+    dependencies:
+      - target: Harbor
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "${HARBOR_BUNDLE_ID}.uitests"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Harbor
+
+  HarborPhone:
+    type: application
+    platform: iOS
+    sources:
+      - path: iPhone/Sources
+      - path: App/Shared
+      - path: iPhone/Assets.xcassets
+      - path: App/Fonts
+        buildPhase: resources
+      - path: App/Generated/Engine/harbor-engine.js
+        buildPhase: resources
+      - path: App/Generated/awards.json
+        buildPhase: resources
+      - path: App/Generated/Locales
+        buildPhase: resources
+      - path: App/Generated/kids
+        type: folder
+      - path: App/Generated/avatars
+        type: folder
+      - path: App/Generated/badges
+        type: folder
+      - path: App/Generated/marks
+        type: folder
+    dependencies:
+      - package: MPVKit
+        product: MPVKit
+      - framework: rust/out/HarborFFI.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "${HARBOR_BUNDLE_ID}.ios"
+        PRODUCT_NAME: Harbor
+        PRODUCT_MODULE_NAME: HarborPhone
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: iPhone/Info.plist
+      configs:
+        Debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: ["DEBUG"]
+    info:
+      path: iPhone/Info.plist
+      properties:
+        CFBundleDisplayName: Harbor
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        HarborBaseID: "${HARBOR_BUNDLE_ID}"
+        ITSAppUsesNonExemptEncryption: false
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities: [arm64]
+        UIAppFonts: *fonts
+        CFBundleURLTypes: *urlTypes
+        NSAppTransportSecurity: *ats
+        NSLocalNetworkUsageDescription: Harbor uses your local network to link your Apple TV and to play from home media servers.
+        NSCameraUsageDescription: Harbor uses the camera to scan addon and sign-in QR codes.
+        CFBundleLocalizations: *langs
+        LSApplicationQueriesSchemes: [infuse, vlc-x-callback, open-vidhub]
+        UIBackgroundModes: [audio]
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+
+  HarborPhoneTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [iPhone/Tests]
+    dependencies:
+      - target: HarborPhone
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "${HARBOR_BUNDLE_ID}.ios.tests"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Harbor.app/Harbor"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
+  HarborPhoneUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [iPhone/UITests]
+    dependencies:
+      - target: HarborPhone
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "${HARBOR_BUNDLE_ID}.ios.uitests"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: HarborPhone
+
+schemes:
+  Harbor:
+    build:
+      targets:
+        Harbor: all
+        HarborUITests: [test]
+    test:
+      config: Debug
+      targets: [HarborUITests]
+    archive:
+      config: Release
+  HarborPhone:
+    build:
+      targets:
+        HarborPhone: all
+        HarborPhoneTests: [test]
+        HarborPhoneUITests: [test]
+    test:
+      config: Debug
+      targets: [HarborPhoneTests, HarborPhoneUITests]
+    archive:
+      config: Release

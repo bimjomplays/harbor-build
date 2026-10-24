@@ -1,0 +1,1446 @@
+import SwiftUI
+import UIKit
+import Combine
+
+/// Detail page (bp-detail): hero with backdrop, logo/title, facts, actions, synopsis; then episodes.
+struct DetailView: View {
+    @StateObject private var model: DetailModel
+    @ObservedObject private var tmdbHealth = TmdbHealth.shared
+    @State private var picker: (meta: Meta, episode: AnyJSON?)?
+    /// use-bp-stream-play autoPlay: Play and auto-advance fire the best source; "Sources" never does.
+    @State private var pickerAuto = false
+    /// bp-detail.tsx onSources(…, applyPreference): the list was opened by Play (the hero, an
+    /// episode, a Play handed over), so the Play button behavior setting applies to it.
+    @State private var pickerPref = false
+    /// view.ts picker frame `attempt`: how many times the player sent this title back to the picker
+    /// (a stalled or failed auto pick, a stub); 0 for every picker the viewer opens.
+    @State private var pickerAttempt = 0
+    @State private var playing: PlayTarget?
+    /// bp-player-sources: the position the next pick resumes from after "Switch source".
+    @State private var switchFromSec: Double?
+    @State private var related: Meta?
+    @State private var listDialog = false
+    /// The hero's "More" sheet (leadActions).
+    @State private var moreOpen = false
+    @State private var factsDialog = false
+    struct TrailerPick: Identifiable { let ytId: String; let name: String?; var id: String { ytId } }
+    @State private var trailer: TrailerPick?
+    @State private var awardType: DetailModel.TitleAwards.Group?
+    @State private var seasonsSheet = false
+    @State private var rateDialog = false
+    @State private var person: DetailModel.Extras.Cast?
+    /// bp-status-dialog: the tracker whose list status is being changed.
+    @State private var trackerDialog: DetailModel.Tracker?
+    /// detail/bp-synopsis.tsx useBpSynopsis: the overview opened in place ("Read more" / "Show less"),
+    /// and whether the clamp cut anything (measured, not counted: the full text's height against the
+    /// clamped one).
+    @State private var synopsisExpanded = false
+    @State private var synopsisCanExpand = false
+    @State private var synopsisClampedH: CGFloat = 0
+    @State private var synopsisFullH: CGFloat = 0
+    @FocusState private var heroFocus: String?
+    /// The season row: a Kitsu season button ("kitsu-<n>") or a TVDB chip ("chip-<key>").
+    @FocusState private var seasonFocus: String?
+    /// The episode card holding the ring, if any (the strip parks on the resume card only without it).
+    @FocusState private var stripFocus: String?
+    /// The character card under the ring (bp-anime-characters shows the heart there).
+    @FocusState private var characterFocus: Int?
+    /// When a Kitsu season button last lost focus by vanishing (the TVDB chips replacing it).
+    @State private var kitsuFocusLostAt: Date?
+    /// Set by "Try again" while its load runs: the ring goes to Play when the message leaves.
+    @State private var retryHandsPlay = false
+    @Environment(\.dismiss) private var dismiss
+    /// The hero's top on screen. The backdrop is fixed behind the
+    /// scrolling page, so episodes and rows scrolled up over bright art were unreadable; it dims as
+    /// the hero leaves (fully dimmed by the time the episodes reach the top).
+    @State private var heroTop: CGFloat = BP.px(214)
+    private var backdropDim: Double {
+        let gone: CGFloat = (BP.px(214) - heroTop) / BP.px(300)
+        return Double(min(1, max(0, gone))) * 0.86
+    }
+    /// The hero backdrop is sized like a tile's art (PosterSizing): unsized,
+    /// it stayed at whatever fixed tier the catalog (or, for anime, jikan.ts/kitsu.ts/anilist's own
+    /// small-web-card default) gave, however large the box drawing it actually was.
+    @Environment(\.displayScale) private var heroDisplayScale
+    /// Every fullScreenCover over this page (the picker, the player, a dialog) makes it
+    /// disappear and re-appear, which re-runs `.task`. The reload is kept (resume and marks refresh
+    /// after playback), but the hint season and autoPlay act once: an autoPlay page re-opened the
+    /// picker (and instant play fired again) every time the player closed.
+    @State private var didFirstLoad = false
+    /// autoPlay opens the picker once, as soon as the page knows what Play would start
+    /// (DetailModel.knowsPlayTarget), not after the whole page has loaded.
+    @State private var autoPlayFired = false
+    /// Something was played from this page: an episode hint (an AI search
+    /// episode pick) is spent like a Continue Watching one (takeBpPlayIntent). Kept, it put Play back
+    /// on the hinted episode from its start after an auto-advance had moved the resume point on,
+    /// with the resume label and bar stood down (hintElsewhere).
+    @State private var hintSpent = false
+
+    /// use-bp-detail-actions BpDetailAction.
+    struct HeroAction: Identifiable {
+        let key: String
+        let label: String
+        let icon: String
+        var active = false
+        var badge: String? = nil
+        /// Drawn dimmed and ignored: the cell is leaving but still holds the ring (a vanished button drops focus).
+        var dim = false
+        let run: () -> Void
+        var id: String { key }
+    }
+
+    /// use-bp-detail-actions.ts, in its order: Sources (movies with instant play), Watchlist, trackers,
+    /// Mark watched on Trakt, Favourite, Remind me (series), Rate, Add to list, Mark watched (movies),
+    /// Watch trailer. Download is left out: tvOS has nowhere to keep a film offline. Back closes the page.
+    private var heroActions: [HeroAction] {
+        var out: [HeroAction] = []
+        let hero = model.hero
+        if model.isMovie, SettingsBridge.shared.slice.instantPlay ?? true {
+            // A series has no single set of streams; its Play already is the picker's way in.
+            out.append(HeroAction(key: "sources", label: "Sources", icon: "list.bullet") {
+                pickerAuto = false; pickerPref = false
+                picker = (model.meta, nil)
+            })
+        }
+        // use-bp-detail-actions: always offered (Harbor's own watchlist needs no Stremio account).
+        let saved = model.inWatchlist
+        out.append(HeroAction(key: "watchlist", label: saved ? "In Watchlist" : "Add to Watchlist", icon: saved ? "checkmark" : "plus", active: saved) {
+            guard !model.watchlistBusy else { return }
+            Task { await model.toggleWatchlist() }
+        })
+        for tr in model.trackers {
+            let label = tr.statusLabel.map { "\(tr.name) · \(T($0))" } ?? T("Add to %@", tr.name)
+            out.append(HeroAction(key: tr.key, label: label, icon: "plus", active: tr.status != nil) { trackerDialog = tr })
+        }
+        if model.isMovie, hero?.traktMovie == true {
+            out.append(HeroAction(key: "trakt", label: "Mark watched on Trakt", icon: "t.circle") {
+                Task { await model.traktMarkWatched() }
+            })
+        }
+        let fav = hero?.favorite ?? false
+        out.append(HeroAction(key: "favorite", label: fav ? "Favorited" : "Add to favorites", icon: fav ? "heart.fill" : "heart", active: fav) {
+            Task { await model.toggleFavorite() }
+        })
+        if model.isSeries {
+            let on = hero?.reminder ?? false
+            out.append(HeroAction(key: "reminder", label: on ? "Reminder on" : "Remind me", icon: on ? "bell.fill" : "bell", active: on) {
+                Task { await model.toggleReminder() }
+            })
+        }
+        let score = hero?.rating
+        out.append(HeroAction(key: "rate", label: score.map { T("Your rating %lld/10", $0) } ?? "Rate this", icon: score == nil ? "star" : "star.fill",
+                              active: score != nil, badge: score.map { String($0) }) { rateDialog = true })
+        out.append(HeroAction(key: "lists", label: "Add to list", icon: "square.stack.3d.up") { listDialog = true })
+        if model.resume != nil {
+            out.append(HeroAction(key: "cw-remove", label: "Remove from Continue watching", icon: "xmark.circle") {
+                Task { _ = await model.removeFromContinueWatching() }
+            })
+        }
+        if model.isMovie, hero?.showWatchedButton ?? true {
+            let watched = model.movieWatched
+            // Its own glyph: two plain checkmarks (Watchlist and Watched) read alike.
+            out.append(HeroAction(key: "watched", label: watched ? "Marked watched" : "Mark watched", icon: watched ? "eye.fill" : "eye", active: watched) {
+                Task { await model.toggleWatched() }
+            })
+        }
+        if let yt = model.trailerYtId {
+            out.append(HeroAction(key: "trailer", label: "Watch trailer", icon: "film") { trailer = TrailerPick(ytId: yt, name: nil) })
+        }
+        // bp-detail-hero `trailing`: the synopsis toggle is the actions track's last cell (before the
+        // TV's Back), so Down from Play still goes to the episodes. It stays, dimmed, while it holds the
+        // ring after a new overview reset it.
+        if synopsisCanExpand || heroFocus == "synopsis" {
+            let open = synopsisExpanded
+            let usable = synopsisCanExpand
+            out.append(HeroAction(key: "synopsis", label: open ? "Show less" : "Read more", icon: "text.alignleft", active: open, dim: !usable) {
+                guard usable else { return }
+                synopsisExpanded.toggle()
+            })
+        }
+        return out
+    }
+
+    /// Play plus the few actions people reach for — Sources,
+    /// Watchlist, Watched / Remind me, Trailer — and a "More" cell for the rest (Favourite, Rate, Add
+    /// to list, trackers, Trakt, Read more). Nine bare icons in a row (Back among them, though Menu
+    /// already goes back) read as clutter. Same actions, same order, same focus keys.
+    private static let leadKeys: Set<String> = ["sources", "watchlist", "watched", "reminder", "trailer"]
+
+    private var leadActions: [HeroAction] {
+        let all: [HeroAction] = heroActions
+        var out: [HeroAction] = all.filter { Self.leadKeys.contains($0.key) }
+        let rest: [HeroAction] = all.filter { !Self.leadKeys.contains($0.key) }
+        if !rest.isEmpty {
+            out.append(HeroAction(key: "more", label: "More", icon: "ellipsis", active: rest.contains { $0.active }) { moreOpen = true })
+        }
+        return out
+    }
+
+    private var moreActions: [HeroAction] { heroActions.filter { !Self.leadKeys.contains($0.key) } }
+
+    struct PlayTarget: Identifiable {
+        var id: String { url.absoluteString }
+        var url: URL
+        var headers: [String: String]
+        var title: String
+        var subtitle: String?
+        var context: PlaybackContext
+        var upNext: String?
+        var episode: AnyJSON?
+        /// What the Auto engine rule reads (engine/player.ts pickEngine).
+        var hints: PlayerStreamHints? = nil
+        /// PlayerSrc autoFired / attempt / streamRef (views/player.tsx next-stream skip).
+        var pick: PlayerPickInfo? = nil
+        /// PlayerSrc.subtitles (use-pick-handler `subtitles: r.data.subtitles`): the stream's own subtitles.
+        var subtitles: [SeedSubtitle] = []
+        /// (S4) PlayerSrc.subtitlePreselect: the picker's subtitle step chose it.
+        var preselect: SubtitlePreselect? = nil
+    }
+
+    /// Quick panel / Discovery Queue "Play now": open the picker as soon as the page knows what to play.
+    var autoPlay = false
+    /// views/detail.tsx episodeHint (an AI search episode pick, ai-result-list.tsx): the page opens
+    /// on that season and Play starts that episode.
+    var episodeHint: (season: Int, episode: Int)? = nil
+    init(meta: Meta, autoPlay: Bool = false, episodeHint: (season: Int, episode: Int)? = nil) {
+        _model = StateObject(wrappedValue: DetailModel(meta: meta)); self.autoPlay = autoPlay
+        self.episodeHint = episodeHint
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            backdrop
+            ScrollView(.vertical, showsIndicators: false) {
+                // bp-detail.tsx: the rows column sits mt-[clamp(44px,5.5vh,88px)] under the hero, then
+                // each row (episodes included, the first entry in `rows`) is --bp-row-gap
+                // (clamp(20px,2.6vh,40px)) apart — two different gaps, not one (was 26/26 for both).
+                VStack(alignment: .leading, spacing: BP.px(20)) {
+                    VStack(alignment: .leading, spacing: BP.px(44)) {
+                        hero
+                            // Where the hero sits now: the backdrop dims as it scrolls away.
+                            .onGeometryChange(for: CGFloat.self) { g in g.frame(in: .global).minY } action: { y in heroTop = y }
+                        if model.isSeries { episodes }
+                    }
+                    .padding(.horizontal, BP.gutter)
+                    // Rail rows carry their own gutter (BPRowView), so they sit outside the padded column.
+                    tmdbRows
+                    // A film with no TMDB rows ended in a tall empty tail: the page ends after the last real section.
+                    if hasTmdbRows { Color.clear.frame(height: BP.px(60)) }
+                }
+                // 250 left a series' season chips on the bottom edge of the first
+                // screen with no episode in view; 214 brings the strip's top up into it.
+                .padding(.top, BP.px(214))
+            }
+        }
+        .ignoresSafeArea()
+        // The hero's "More" (leadActions): the rest of the actions as tvOS's own action sheet. A pick
+        // that opens a dialog of its own waits for the sheet to go first.
+        .confirmationDialog(Text(verbatim: model.meta.name), isPresented: $moreOpen, titleVisibility: .visible) {
+            ForEach(moreActions) { a in
+                Button(T(a.label)) {
+                    let run: () -> Void = a.run
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { run() }
+                }
+            }
+            Button(T("Cancel"), role: .cancel) {}
+        }
+        .task {
+            model.episodeHintSeason = episodeHint?.season
+            // A Continue Watching one-press resume names its episode only for that one play (bp-detail
+            // takeBpPlayIntent consumes the intent): once it fired, Play and the strip follow the resume
+            // point again, not the episode the page was opened for (an auto-advance moved on from it).
+            model.episodeHint = (autoPlayFired || hintSpent) ? nil : episodeHint
+            let first = !didFirstLoad
+            didFirstLoad = true
+            await model.load()
+            guard first else { return }
+            if let h = episodeHint, model.seasons.contains(h.season) { model.season = h.season }
+            // Normally fired already from the stage change below; this catches a load that
+            // finished before the observer saw a stage.
+            fireAutoPlayIfReady()
+        }
+        // bp-detail's pending-play effect: open playback once the meta and the episode are known;
+        // awards, trackers, recommendations and the rest keep loading under the picker.
+        .onChange(of: model.loadStage) { _, _ in fireAutoPlayIfReady() }
+        .fullScreenCover(isPresented: Binding(get: { picker != nil }, set: { if !$0 { picker = nil } }), onDismiss: { pickerAttempt = 0 }) {
+            if let picker {
+                PlayPickerView(meta: picker.meta, episode: picker.episode, onPlay: { stream, resolved in
+                    guard let link = resolved.data, let url = PlayableURL.make(link.url) else { return }   // the picker checked it
+                    let ep = picker.episode
+                    let preselect: SubtitlePreselect? = resolved.subtitlePreselect
+                    let sub = ep.flatMap { e -> String? in
+                        guard let s = e["season"]?.number, let n = e["episode"]?.number else { return nil }
+                        return "S\(Int(s)) E\(Int(n))" + (e["name"]?.string.map { " · \($0)" } ?? "")
+                    }
+                    self.picker = nil
+                    let pick = PlayerPickInfo(autoPicked: resolved.autoPicked ?? false, attempt: pickerAttempt, streamRef: resolved.streamRef)
+                    let ctx = PlaybackContext(meta: model.meta,
+                                              season: ep?["season"]?.number.map { Int($0) }, episode: ep?["episode"]?.number.map { Int($0) },
+                                              videoId: ep?["videoId"]?.string, imdbId: model.meta.id.hasPrefix("tt") ? model.meta.id : nil,
+                                              imdbVerified: model.meta.id.hasPrefix("tt"), homeServer: resolved.homeServer,
+                                              explicitStartSec: switchFromSec)
+                    switchFromSec = nil
+                    // Present after the picker's cover has dismissed; a present-while-dismissing is dropped on tvOS.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        Task { @MainActor in
+                            var upNext: String?
+                            // views/player.tsx nextEpMask: a hidden title leaves only "S E" on the up-next card.
+                            if let s = ctx.season, let e = ctx.episode, let n = model.airedNext(season: s, episode: e) {
+                                upNext = await model.upNextText(n)
+                            }
+                            let hints = PlayerStreamHints(notWebReady: link.notWebReady, container: stream?.container,
+                                                          hdrFormat: stream?.hdrFormat, filename: link.filename)
+                            playing = PlayTarget(url: url, headers: link.headers ?? [:], title: model.meta.name, subtitle: sub, context: ctx, upNext: upNext, episode: ep, hints: hints, pick: pick,
+                                                 subtitles: link.subtitles ?? [], preselect: preselect)
+                        }
+                    }
+                }, autoPlay: pickerAuto, applyPreference: pickerPref, subtitleStep: true)
+            }
+        }
+        .fullScreenCover(item: $related) { m in DetailView(meta: m) }
+        .fullScreenCover(isPresented: $listDialog) { ListDialogView(meta: model.meta) }
+        .fullScreenCover(isPresented: $factsDialog) { FactsDialogView(title: model.meta.name, facts: model.extras?.facts ?? []) }
+        .fullScreenCover(item: $trailer) { t in TrailerView(ytId: t.ytId, title: model.meta.name, clipName: t.name) { trailer = nil } }
+        .fullScreenCover(isPresented: $seasonsSheet) {
+            SeasonsSheet(seasons: model.seasons, counts: Dictionary(grouping: model.episodes, by: \.season).mapValues(\.count), season: Binding(get: { model.season }, set: { model.pickKitsuSeason($0) }))
+        }
+        .fullScreenCover(item: $awardType) { g in AwardsDialogView(group: g, entries: (model.awards?.entries ?? []).filter { $0.type == g.type }) }
+        // The Rate cell shows the score, so it re-reads the rating when the dialog closes.
+        .fullScreenCover(isPresented: $rateDialog, onDismiss: { Task { await model.loadHero() } }) { RateDialogView(meta: model.meta) }
+        .fullScreenCover(item: $trackerDialog) { tr in
+            TrackerDialogView(tracker: tr,
+                              onPick: { status in Task { await model.setTracker(tr.key, status: status) } },
+                              onRemove: { Task { await model.removeTracker(tr.key) } })
+        }
+        .fullScreenCover(item: $person) { c in PersonView(personId: c.id, name: c.name) }
+        .fullScreenCover(item: $playing) { t in
+            PlayerScreen(title: t.title, subtitle: t.subtitle, url: t.url, headers: t.headers, context: t.context, upNext: t.upNext, streamHints: t.hints,
+                         onChooseAnother: { pickerAuto = false; pickerPref = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { picker = (model.meta, t.episode) } },
+                         onSwitchSource: { at in pickerAuto = false; pickerPref = false; switchFromSec = at; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { picker = (model.meta, t.episode) } },
+                         onPreviousEpisode: previousEpisodeAction(t.context), pick: t.pick,
+                         onPickAgain: { auto in
+                             // views/player.tsx openPicker(meta, episode, { autoPlay: true, attempt: attempt + 1 }).
+                             pickerAuto = auto; pickerPref = false
+                             let next = (t.pick?.attempt ?? 0) + 1
+                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { pickerAttempt = next; picker = (model.meta, t.episode) }
+                         }, streamSubtitles: t.subtitles, pickEpisode: t.episode, subtitlePreselect: t.preselect) { natural in
+                playing = nil
+                hintSpent = true
+                model.episodeHint = nil
+                // The strip's started / next-up (and so its spoiler masks) move with what was just played.
+                Task { await model.loadWatchedState() }
+                // Auto-advance (player-spec §1.9, simplified): a finished episode opens the next one's picker.
+                if natural, let s = t.context.season, let e = t.context.episode, let next = model.airedNext(season: s, episode: e) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                        guard picker == nil else { return }
+                        pickerAuto = SettingsBridge.shared.slice.instantPlay ?? true; pickerPref = false; picker = (model.meta, next.playEpisode)
+                    }
+                }
+            }
+        }
+    }
+
+    /// autoPlay (quick panel / queue "Play", a Continue Watching resume):
+    /// opens the picker once, the first time the page knows what Play starts. A failed load still
+    /// ends in a stage, so it behaves as before (picker over the page it could show).
+    private func fireAutoPlayIfReady() {
+        guard autoPlay, !autoPlayFired, model.knowsPlayTarget() else { return }
+        autoPlayFired = true
+        // The play request is spent (takeBpPlayIntent): the hint goes once the picker has its episode.
+        defer { model.episodeHint = nil }
+        // A picker the viewer already opened by hand wins; the autoplay is spent either way.
+        guard picker == nil else { return }
+        if let h = episodeHint, model.seasons.contains(h.season) { model.season = h.season }
+        pickerAuto = SettingsBridge.shared.slice.instantPlay ?? true
+        pickerPref = true
+        if model.isSeries { picker = (model.meta, model.playTarget?.playEpisode ?? model.premiereEpisode) } else { picker = (model.meta, nil) }
+    }
+
+    /// bp-player-controls "Previous episode": the episode before this one opens its picker (after
+    /// the player's cover has dismissed, like Switch source); nil on the first episode or a movie.
+    private func previousEpisodeAction(_ ctx: PlaybackContext) -> (() -> Void)? {
+        // series-episodes.ts computeAdjacent: a special (season 0) is not on
+        // the adjacency list, so it has no previous episode either.
+        guard let s = ctx.season, s > 0, let e = ctx.episode,
+              let idx = model.episodes.firstIndex(where: { $0.season == s && $0.episode == e }), idx > 0 else { return nil }
+        let prev = model.episodes[idx - 1]
+        guard prev.season > 0 else { return nil }
+        let episode = prev.playEpisode
+        return {
+            pickerAuto = SettingsBridge.shared.slice.instantPlay ?? true
+            pickerPref = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { picker = (model.meta, episode) }
+        }
+    }
+
+    private var backdrop: some View {
+        ZStack {
+            BP.void_
+            GeometryReader { g in
+                // components/poster.tsx / PosterSizing: sized like a browse tile's art, not shown as
+                // the catalog (or, for anime, jikan.ts/kitsu.ts/anilist's small-web-card default) gave
+                // it — this box is most of the screen, far past any fixed tile size a poster's tier
+                // was ever chosen for.
+                let sized = PosterSizing.sized(model.meta.background ?? model.meta.poster, width: g.size.width * 0.76,
+                                                scale: heroDisplayScale, quality: SettingsBridge.shared.slice.posterQuality)
+                // The fades are masked on the still ITSELF (before it is pinned top-trailing): masked
+                // after, the gradient ran over the whole page and the still's own left edge showed as
+                // a hard vertical line at 24 % of the width.
+                // The two alpha masks left the still's bottom as a
+                // hard horizontal line on bright art (the fill image ran past its frame unclipped, so
+                // the masks never covered all of it). Clipped to its box, it now fades into the
+                // page's own void with opaque scrims on its leading and bottom edges, so no edge of
+                // the box can show whatever the art is.
+                RemoteImage(url: sized)
+                    .frame(width: g.size.width * 0.76, height: g.size.height * 0.8)
+                    .clipped()
+                    .overlay(
+                        LinearGradient(stops: [.init(color: BP.void_, location: 0), .init(color: BP.void_.opacity(0.55), location: 0.22),
+                                               .init(color: .clear, location: 0.5)], startPoint: .leading, endPoint: .trailing)
+                            .flipsForRightToLeftLayoutDirection(true)
+                    )
+                    .overlay(
+                        LinearGradient(stops: [.init(color: .clear, location: 0.3), .init(color: BP.void_.opacity(0.7), location: 0.7),
+                                               .init(color: BP.void_, location: 0.97)], startPoint: .top, endPoint: .bottom)
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            }
+            LinearGradient(colors: [BP.void_.opacity(0.85), BP.void_.opacity(0.4), .clear], startPoint: .leading, endPoint: .init(x: 0.7, y: 0.5))
+                // bp-tokens.ts --bp-scrim-side: the side scrim runs from the start edge (260deg under rtl).
+                .flipsForRightToLeftLayoutDirection(true)
+            BP.void_.opacity(backdropDim)
+        }
+        .ignoresSafeArea()
+        // hero-backdrop.tsx: the layered still is alt="" aria-hidden; the logo/title over it names the page.
+        .accessibilityHidden(true)
+    }
+
+    private var hero: some View {
+        VStack(alignment: .leading, spacing: BP.px(14)) {
+            if let logo = model.meta.logo, !logo.isEmpty {
+                // bp-detail-hero.tsx data-bp-detail-logo: max-h-[clamp(107px,16.7vh,160px)]
+                // max-w-[min(28vw,320px)] — was sized like the Home spotlight's own (larger) logo box.
+                RemoteImage(url: logo, contentMode: .fit, alignment: .leading).frame(maxWidth: BP.px(320), maxHeight: BP.px(107), alignment: .leading)
+                    // The title logo is the page's heading: VoiceOver reads the name it draws.
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(Text(verbatim: model.meta.name))
+                    .accessibilityAddTraits(.isHeader)
+            } else {
+                // bp-detail-hero.tsx no-logo h1: max-w-[min(36vw,410px)] (was 700, ~70% too wide,
+                // let a long title run far past where upstream wraps it to a second line).
+                // A long name ("I Want to Love You Till Your Dying Day") was cut to
+                // "Your Dyi…": long names set smaller and wider, then shrink to fit two lines.
+                let long: Bool = model.meta.name.count > 26
+                Text(model.meta.name).font(BP.display(long ? 40 : 52)).foregroundStyle(BP.ink).lineLimit(2).minimumScaleFactor(0.6)
+                    .frame(maxWidth: BP.px(long ? 500 : 410), alignment: .leading)
+                    .accessibilityAddTraits(.isHeader)
+            }
+            HStack(spacing: 0) {
+                // bp-detail: every provider the detail settings allow (use-bp-card-badges "detail").
+                ScoreChipsView(meta: model.meta, surface: "detail", limit: 6, trailingGap: BP.px(12))
+                Text(heroFacts).font(BP.sans(13.4, .medium)).foregroundStyle(BP.inkMuted)
+                    .padding(.trailing, BP.px(12))
+                // bp-hero-notes BpHeroMarks: one mark per connected server that has this title.
+                ForEach(model.titleServers) { server in MediaServerMark(server: server).padding(.trailing, BP.px(12)) }
+                // BpHeroMarks origin?.name: the addon that served this title, its logo and name.
+                if let origin = model.meta.addonOrigin, !origin.name.isEmpty { AddonOriginMark(origin: origin) }
+            }
+            HStack(spacing: BP.px(8)) {
+                Button {
+                    pickerAuto = SettingsBridge.shared.slice.instantPlay ?? true
+                    pickerPref = true
+                    if model.isSeries { picker = (model.meta, model.playTarget?.playEpisode ?? model.premiereEpisode) }
+                    else { picker = (model.meta, nil) }
+                } label: {
+                    // Progress under Play, only mid-way through (0.01 < progress < 0.97).
+                    // Hidden when an AI search episode pick names another episode (it plays from its start),
+                    // or an anime's next-up is the target instead of the local resume point.
+                    // As a VStack sibling the GeometryReader took every pt the row
+                    // offered and stretched Resume to ~580 pt; drawn in the label's overlay it is as
+                    // wide as "Resume" itself.
+                    Label(model.playLabel, systemImage: "play.fill")
+                        .overlay(alignment: .bottomLeading) {
+                            if let r = model.resume, model.resumeIsPlayTarget, r.progress > 0.01, r.progress < 0.97 {
+                                GeometryReader { g in
+                                    ZStack(alignment: .leading) {
+                                        Capsule().fill(BP.canvas.opacity(0.25))
+                                        Capsule().fill(BP.accent).frame(width: g.size.width * r.progress)
+                                    }
+                                }
+                                .frame(height: BP.px(3))
+                                .offset(y: BP.px(9))
+                            }
+                        }
+                }
+                .buttonStyle(BPActionStyle(primary: true))
+                .focused($heroFocus, equals: "play")
+                .accessibilityIdentifier("detail-play")
+                // The resume bar under Play, read as "{n}% watched" when it is drawn.
+                .bpProgressValue(model.resumeIsPlayTarget ? model.resume?.progress : nil)
+                // bp-detail-actions BpSecondaryAction: icon cells; the line under the row names the focused one.
+                ForEach(leadActions) { a in
+                    Button { a.run() } label: {
+                        if let badge = a.badge {
+                            Text(badge).font(BP.sans(13.4, .bold)).monospacedDigit()
+                        } else {
+                            Image(systemName: a.icon)
+                        }
+                    }
+                    .buttonStyle(DetailIconActionStyle(active: a.active))
+                    .opacity(a.dim ? 0.45 : 1)
+                    .focused($heroFocus, equals: a.key)
+                    .accessibilityLabel(T(a.label))
+                    .bpSelected(a.active)
+                    .accessibilityIdentifier("detail-action-\(a.key)")
+                }
+            }
+            .focusSection()
+            // BP_ACTION_HINT: the focused icon's label; blank when Play or nothing in the row has focus.
+            Text(leadActions.first(where: { $0.key == heroFocus }).map { T($0.label) } ?? " ")
+                .font(BP.sans(12.5, .semibold)).tracking(0.5).foregroundStyle(BP.inkSubtle)
+                .frame(height: BP.px(16), alignment: .leading)
+            if let tag = model.extras?.tagline, !tag.isEmpty {
+                // bp-detail-hero.tsx data-bp-detail-tagline: max-w-[min(36vw,410px)] (was 620, ~50% too wide).
+                Text(tag).font(BP.sans(14, .semibold)).italic().foregroundStyle(BP.inkMuted).lineLimit(1).frame(maxWidth: BP.px(410), alignment: .leading)
+            }
+            synopsis
+            // bp-hero-notes BpTmdbKeyNote (bp-detail-hero; the anime hero has none).
+            if !model.isAnimeId, SettingsBridge.shared.slice.tmdbKey.isEmpty {
+                // bp-hero-notes.tsx BpTmdbKeyNote: max-w-[min(46vw,820px)], same column as the synopsis.
+                Text(verbatim: T("Add a TMDB key in Settings to see the cast, crew, and details."))
+                    .font(BP.sans(12.5, .medium)).foregroundStyle(BP.inkSubtle).lineSpacing(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: BP.px(524), alignment: .leading)
+            }
+            if let providers = model.extras?.watchOn, !providers.isEmpty { watchOn(providers) }
+            credits
+        }
+    }
+
+    /// bp-logic buildBpFacts: TMDB's runtime and genres first once they are in, else the meta's. The
+    /// hero read Cinemeta's "106 min" over Details' TMDB "129 min" (Digger).
+    private var heroFacts: String {
+        guard let x = model.extras else { return model.meta.facts }
+        var m = model.meta
+        if model.isMovie, let r = x.runtime, !r.isEmpty { m.runtime = r }
+        if !x.genres.isEmpty { m.genres = x.genres }
+        return m.facts
+    }
+
+    private var overviewText: String { model.meta.description ?? model.extras?.overview ?? "" }
+
+    /// detail/bp-synopsis.tsx BpSynopsis: clamped (4 lines on the TV) until the actions row's "Read
+    /// more" opens it in place. A hidden unclamped copy at the same width measures whether the clamp
+    /// cut anything (useBpSynopsis: scrollHeight against clientHeight, more than 2 px).
+    private var synopsis: some View {
+        let text: String = overviewText
+        // bp-synopsis.tsx BpSynopsis: line-clamp-3 (was 4) at max-w-[min(46vw,820px)] (was 620).
+        return Text(verbatim: text).font(BP.sans(13, .regular)).foregroundStyle(BP.inkMuted).lineSpacing(4)
+            .lineLimit(synopsisExpanded ? nil : 3)
+            .frame(maxWidth: BP.px(524), alignment: .leading)
+            .background(alignment: .topLeading) {
+                GeometryReader { g in
+                    ZStack(alignment: .topLeading) {
+                        Color.clear
+                            .onAppear { synopsisClampedH = g.size.height; measureSynopsis() }
+                            .onChange(of: g.size.height) { _, h in synopsisClampedH = h; measureSynopsis() }
+                        Text(verbatim: text).font(BP.sans(13, .regular)).lineSpacing(4)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(width: g.size.width, alignment: .leading)
+                            .background(GeometryReader { full in
+                                Color.clear
+                                    .onAppear { synopsisFullH = full.size.height; measureSynopsis() }
+                                    .onChange(of: full.size.height) { _, h in synopsisFullH = h; measureSynopsis() }
+                            })
+                            .opacity(0)
+                            .accessibilityHidden(true)
+                    }
+                }
+            }
+            // useBpSynopsis: a new overview closes and re-measures.
+            .onChange(of: text) { _, _ in
+                synopsisExpanded = false
+                synopsisCanExpand = false
+                // A new overview that measures the same as the last one (both past the
+                // clamp, same line count) fires neither height onChange, so Read more never came
+                // back: re-measure from the kept heights once the new text has laid out (a height
+                // that did change has been stored by its own onChange by then).
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { measureSynopsis() }
+            }
+    }
+
+    /// useBpSynopsis measure: only while clamped, and it only ever turns the toggle on.
+    private func measureSynopsis() {
+        guard !synopsisExpanded, synopsisFullH - synopsisClampedH > 2 else { return }
+        if !synopsisCanExpand { synopsisCanExpand = true }
+    }
+
+    // bp-watch-on-row: provider marks, not a picker.
+    private func watchOn(_ providers: [DetailModel.Extras.Provider]) -> some View {
+        HStack(spacing: BP.px(8)) {
+            Text("Watch on").font(BP.sans(11, .bold)).tracking(1).foregroundStyle(BP.inkSubtle)
+            ForEach(providers.prefix(8)) { p in
+                RemoteImage(url: p.logo, contentMode: .fit).frame(width: BP.px(28), height: BP.px(28)).clipShape(RoundedRectangle(cornerRadius: BP.px(6), style: .continuous))
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(p.name)
+            }
+        }
+    }
+
+    /// True when any row under the hero has something to draw. The gallery is async and pads itself,
+    /// so a keyed install does not count as having rows.
+    private var hasTmdbRows: Bool {
+        if !model.characters.isEmpty { return true }
+        if let a = model.awards, !a.groups.isEmpty { return true }
+        guard let x = model.extras else { return false }
+        return !x.cast.isEmpty || !x.crew.isEmpty || model.collectionRow != nil || !x.recommendations.isEmpty
+            || !x.similar.isEmpty || !(x.videos ?? []).isEmpty || !x.facts.isEmpty
+    }
+
+    /// The rows under the hero (detail-spec §1.1 order): cast, collection, More Like This, You Might Also Like, facts.
+    @ViewBuilder private var tmdbRows: some View {
+        if !model.characters.isEmpty { charactersRow }
+        if let a = model.awards, !a.groups.isEmpty { awardsRow(a) }
+        if !model.isAnimeId, !SettingsBridge.shared.slice.tmdbKey.isEmpty { GalleryRow(meta: model.meta) }
+        if let x = model.extras {
+            if !x.cast.isEmpty { castRow(x.cast) }
+            crewSection
+            if let col = model.collectionRow { BPRowView(row: col, onFocus: { _ in }, onSelect: { related = $0 }) }
+            if !x.recommendations.isEmpty { BPRowView(row: BrowseRow(key: "recommendations", title: T("More Like This"), metas: x.recommendations), onFocus: { _ in }, onSelect: { related = $0 }) }
+            if !x.similar.isEmpty { BPRowView(row: BrowseRow(key: "similar", title: T("You Might Also Like"), metas: x.similar), onFocus: { _ in }, onSelect: { related = $0 }) }
+            if let v = x.videos, !v.isEmpty { videosRow(v) }
+            if !x.facts.isEmpty { factsCard(x.facts) }
+        }
+    }
+
+    // detail/bp-videos-row: 16:9 YouTube thumbnails, kind over name; Select opens the trailer overlay.
+    private func videosRow(_ clips: [DetailModel.Extras.Video]) -> some View {
+        VStack(alignment: .leading, spacing: BP.px(10)) {
+            Text("Videos").font(BP.sans(19, .bold)).foregroundStyle(BP.ink).padding(.horizontal, BP.gutter).accessibilityAddTraits(.isHeader)
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: BP.trackGap) {
+                    ForEach(Array(clips.enumerated()), id: \.element.id) { i, c in
+                        Button { trailer = TrailerPick(ytId: c.ytId, name: c.name) } label: {
+                            VStack(alignment: .leading, spacing: 0) {
+                                // mqdefault is 320 px wide, soft on a 4K TV: the
+                                // 1280 px still first, mqdefault when YouTube has none (it 404s).
+                                RemoteImage(url: "https://img.youtube.com/vi/\(c.ytId)/maxresdefault.jpg",
+                                            fallback: "https://img.youtube.com/vi/\(c.ytId)/mqdefault.jpg")
+                                    .frame(width: BP.px(300), height: BP.px(169)).clipped()
+                                VStack(alignment: .leading, spacing: BP.px(3)) {
+                                    Text(T(c.type)).font(BP.sans(10, .bold)).textCase(.uppercase).tracking(1.4).foregroundStyle(BP.inkSubtle).lineLimit(1)
+                                    // bp-videos-row.tsx: the engine's unnamed extra trailers are t("Trailer").
+                                    // Four cards all read "TRAILER / Trailer": unnamed
+                                    // ones are numbered within the row (the row opened on "Trailer 2").
+                                    Text(c.name == "Trailer" ? "\(T("Trailer")) \(clips.prefix(i + 1).filter { $0.name == "Trailer" }.count)" : c.name).font(BP.sans(14, .semibold)).foregroundStyle(BP.ink).lineLimit(1)
+                                }
+                                .padding(BP.px(10)).frame(width: BP.px(300), alignment: .leading)
+                            }
+                            .background(BP.panel)
+                            .clipShape(RoundedRectangle(cornerRadius: BP.rMD, style: .continuous))
+                        }
+                        .buttonStyle(BPTileStyle(radius: BP.rMD))
+                        .accessibilityLabel(c.name)
+                    }
+                }
+                .padding(.horizontal, BP.gutter).padding(.vertical, BP.px(14))
+            }
+            .scrollClipDisabled()
+        }
+        .focusSection()
+    }
+
+    /// bp-awards-row.tsx t("{n} wins") / t("{n} nominations"), with the nominations beside a win.
+    private func awardCounts(_ g: DetailModel.TitleAwards.Group) -> String {
+        let noms = TCount(g.nominations, one: "%lld nomination", "%lld nominations")
+        guard g.wins > 0 else { return noms }
+        let wins = TCount(g.wins, one: "%lld win", "%lld wins")
+        return g.nominations > 0 ? "\(wins) · \(noms)" : wins
+    }
+
+    // detail/bp-awards-row: one cell per award body; Select opens the categories and years.
+    private func awardsRow(_ a: DetailModel.TitleAwards) -> some View {
+        VStack(alignment: .leading, spacing: BP.px(10)) {
+            Text("Awards & Recognition").font(BP.sans(19, .bold)).foregroundStyle(BP.ink).padding(.horizontal, BP.gutter).accessibilityAddTraits(.isHeader)
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: BP.px(10)) {
+                    ForEach(a.groups) { g in
+                        Button { awardType = g } label: {
+                            VStack(alignment: .leading, spacing: BP.px(4)) {
+                                Text(g.title).font(BP.sans(14, .bold)).foregroundStyle(BP.ink).lineLimit(1)
+                                Text(awardCounts(g))
+                                    .font(BP.sans(12)).foregroundStyle(BP.inkMuted)
+                            }
+                            .padding(BP.px(14)).frame(width: BP.px(260), alignment: .leading)
+                            .background(RoundedRectangle(cornerRadius: BP.rSM, style: .continuous).fill(BP.panel2))
+                        }
+                        .buttonStyle(BPTileStyle(radius: BP.rSM))
+                    }
+                }
+                .padding(.horizontal, BP.gutter).padding(.vertical, BP.px(10))
+            }
+            .scrollClipDisabled()
+        }
+        .focusSection()
+    }
+
+    // bp-anime-characters: AniList characters, distinct from the cast row.
+    // BpCharacterCell: the cell itself is the toggle (Select favourites the
+    // character in lib/character-favorites, the store the desktop Favorites tab reads). A 2:3
+    // portrait card, the name, then the raw role and the compact AniList favourites count; the heart
+    // shows the state always and the affordance only under the ring.
+    private var charactersRow: some View {
+        VStack(alignment: .leading, spacing: BP.px(10)) {
+            Text(T("Characters")).font(BP.sans(19, .bold)).foregroundStyle(BP.ink).padding(.horizontal, BP.gutter).accessibilityAddTraits(.isHeader)
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: BP.trackGap) {
+                    ForEach(model.characters) { c in
+                        characterCell(c)
+                    }
+                }
+                .padding(.horizontal, BP.gutter).padding(.vertical, BP.px(14))
+            }
+            .scrollClipDisabled()
+        }
+        .focusSection()
+    }
+
+    private func characterCell(_ c: DetailModel.AnimeCharacter) -> some View {
+        let favorite: Bool = model.favoriteCharacters.contains(String(c.id))
+        let focused: Bool = characterFocus == c.id
+        // Raw, like the desktop card: character.role is provider data, never a UI string.
+        let role: String = c.role ?? ""
+        let count: String = (c.favourites ?? 0) > 0 ? Self.compactCount(c.favourites ?? 0) : ""
+        let sub: String = [role, count].filter { !$0.isEmpty }.joined(separator: " · ")
+        let width: CGFloat = BP.px(114)
+        return Button {
+            BPSound.shared.click()
+            Task { await model.toggleCharacter(c) }
+        } label: {
+            VStack(alignment: .leading, spacing: 0) {
+                ZStack(alignment: .topTrailing) {
+                    ZStack {
+                        BP.panel2
+                        if let image = c.image, !image.isEmpty {
+                            RemoteImage(url: image)
+                        } else {
+                            Image(systemName: "person").font(.system(size: BP.px(22), weight: .regular)).foregroundStyle(BP.inkSubtle)
+                        }
+                    }
+                    .frame(width: width, height: width * 1.5)
+                    .clipped()
+                    Image(systemName: favorite ? "heart.fill" : "heart")
+                        .font(.system(size: BP.px(12), weight: .semibold))
+                        .foregroundStyle(favorite ? BP.ink : BP.inkMuted)
+                        .frame(width: BP.px(24), height: BP.px(24))
+                        .background(Circle().fill(favorite ? BP.on : BP.void_.opacity(0.92)))
+                        .padding(BP.px(5))
+                        .opacity(favorite || focused ? 1 : 0)
+                        .animation(.easeOut(duration: 0.16), value: favorite || focused)
+                }
+                VStack(alignment: .leading, spacing: BP.px(2)) {
+                    Text(c.name).font(BP.sans(13, .semibold)).foregroundStyle(BP.ink).lineLimit(1)
+                    if !sub.isEmpty {
+                        Text(sub).font(BP.sans(11, .medium)).foregroundStyle(BP.inkSubtle).lineLimit(1).monospacedDigit()
+                    }
+                }
+                .padding(BP.px(8))
+                .frame(width: width, alignment: .leading)
+            }
+            .frame(width: width)
+            .background(BP.panel)
+            .clipShape(RoundedRectangle(cornerRadius: BP.rMD, style: .continuous))
+        }
+        .buttonStyle(BPTileStyle(radius: BP.rMD))
+        .focused($characterFocus, equals: c.id)
+        // bp-anime-characters.tsx aria-label `${character.name}, ${role}` and aria-pressed.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: role.isEmpty ? c.name : "\(c.name), \(role)"))
+        .accessibilityAddTraits(favorite ? .isSelected : [])
+    }
+
+    /// bp-anime-characters formatCount: Intl compact notation, at most one decimal ("12.3K").
+    private static func compactCount(_ n: Int) -> String {
+        let style: IntegerFormatStyle<Int> = IntegerFormatStyle<Int>(locale: L10n.locale).notation(.compactName).precision(.fractionLength(0...1))
+        return n.formatted(style)
+    }
+
+    // bp-cast-row: round portraits, name over character, up to 20.
+    private func castRow(_ cast: [DetailModel.Extras.Cast]) -> some View {
+        VStack(alignment: .leading, spacing: BP.px(10)) {
+            Text("Cast").font(BP.sans(19, .bold)).foregroundStyle(BP.ink).padding(.horizontal, BP.gutter).accessibilityAddTraits(.isHeader)
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: BP.trackGap) {
+                    // TMDB lists an actor once per role (same person id): unique ids for ForEach.
+                    ForEach(cast.uniquedById()) { person in
+                        Button { self.person = person } label: { CastCell(person: person) }
+                            .buttonStyle(BPPortraitStyle())
+                    }
+                }
+                .padding(.horizontal, BP.gutter).padding(.vertical, BP.px(14))
+            }
+            .scrollClipDisabled()
+        }
+        .focusSection()
+    }
+
+    // bp-facts: a preview card of the first rows.
+    // A Button like bp-facts.tsx's: the bare .focusable() card took focus with no
+    // ring, so the viewer lost track of the focus at the bottom of the page.
+    private func factsCard(_ facts: [DetailModel.Extras.Fact]) -> some View {
+        Button { factsDialog = true } label: {
+            VStack(alignment: .leading, spacing: BP.px(6)) {
+                Text("Details").font(BP.sans(19, .bold)).foregroundStyle(BP.ink).accessibilityAddTraits(.isHeader)
+                ForEach(facts.prefix(8)) { f in
+                    HStack(alignment: .top, spacing: BP.px(8)) {
+                        Text(T(f.label)).font(BP.sans(12, .bold)).foregroundStyle(BP.inkSubtle).frame(width: BP.px(120), alignment: .leading)
+                        Text(f.value).font(BP.sans(12)).foregroundStyle(BP.inkMuted).lineLimit(2)
+                    }
+                }
+            }
+            .padding(BP.px(16))
+            .frame(maxWidth: BP.px(620), alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: BP.rSM, style: .continuous).fill(BP.panel2))
+        }
+        // bp-facts-dialog: Select opens every row in a scrollable sheet.
+        .buttonStyle(BPTileStyle(radius: BP.rSM, lift: 1.02))
+        .padding(.horizontal, BP.gutter)
+    }
+
+    /// Crew/cast lines from Cinemeta until TMDB cast cards arrive (detail-spec §1.1 rows 4-5).
+    /// The TMDB crew lines sit under the cast row,
+    /// like the Apple TV app's Cast & Crew; the hero keeps only Cinemeta's short credit lines.
+    @ViewBuilder private var crewSection: some View {
+        if let crew = model.extras?.crew, !crew.isEmpty {
+            VStack(alignment: .leading, spacing: BP.px(10)) {
+                Text("Crew").font(BP.sans(19, .bold)).foregroundStyle(BP.ink).accessibilityAddTraits(.isHeader)
+                crewLines(crew)
+            }
+            .padding(.horizontal, BP.gutter)
+        }
+    }
+
+    @ViewBuilder private var credits: some View {
+        let director = (model.meta.director ?? []).filter { !$0.isEmpty }
+        let cast = (model.meta.cast ?? []).filter { !$0.isEmpty }
+        if model.extras?.crew.isEmpty == false {
+            EmptyView()
+        } else if !director.isEmpty || !cast.isEmpty {
+            VStack(alignment: .leading, spacing: BP.px(3)) {
+                if !director.isEmpty { creditLine(model.isSeries ? "Created by" : "Directed by", director.prefix(3).joined(separator: ", ")) }
+                if !cast.isEmpty { creditLine("Cast", cast.prefix(6).joined(separator: ", ")) }
+                if model.extras == nil && tmdbHealth.rejected { tmdbRejectedNote }
+            }
+            .frame(maxWidth: BP.px(620), alignment: .leading)
+        }
+    }
+
+    // bp-crew-row: each name is a cell into the Person page when TMDB knows the person.
+    private func crewLines(_ crew: [DetailModel.Extras.Crew]) -> some View {
+            VStack(alignment: .leading, spacing: BP.px(2)) {
+                ForEach(crew.prefix(5)) { c in
+                    HStack(alignment: .top, spacing: BP.px(8)) {
+                        // 80 px broke "Cinematography" over two lines.
+                        Text(T(c.label)).font(BP.sans(12, .semibold)).foregroundStyle(BP.inkSubtle).lineLimit(1).minimumScaleFactor(0.75).frame(width: BP.px(130), alignment: .leading)
+                            .padding(.top, BP.px(4))
+                        HStack(spacing: BP.px(2)) {
+                            ForEach(Array((c.people ?? c.names.map { DetailModel.Extras.Crew.Person(id: nil, name: $0) }).enumerated()), id: \.offset) { _, p in
+                                if let id = p.id {
+                                    Button(p.name) { person = DetailModel.Extras.Cast(id: id, name: p.name, character: "", profile: nil) }.buttonStyle(BPTextLinkStyle())
+                                } else {
+                                    Text(p.name).font(BP.sans(13, .medium)).foregroundStyle(BP.inkMuted).padding(.horizontal, BP.px(10)).padding(.vertical, BP.px(4))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: BP.px(900), alignment: .leading)
+            .focusSection()
+    }
+
+    /// Without this the page just ended under the credits, with no sign why
+    /// the cast, More Like This and trailer rows never came.
+    private var tmdbRejectedNote: some View {
+        Label(T("TMDB refused the saved key, so cast and More Like This are off. Add a new key in Settings → Setup."), systemImage: "exclamationmark.triangle")
+            .font(BP.sans(12.5, .medium)).foregroundStyle(BP.inkSubtle)
+            .padding(.top, BP.px(10))
+    }
+
+    private func creditLine(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: BP.px(8)) {
+            Text(T(label)).font(BP.sans(12, .bold)).foregroundStyle(BP.inkSubtle).frame(width: BP.px(80), alignment: .leading)
+            Text(value).font(BP.sans(12)).foregroundStyle(BP.inkMuted).lineLimit(2)
+        }
+        // Not a control: the label and its names read as one row ("Directed by, ...") not two stops.
+        .accessibilityElement(children: .combine)
+    }
+
+    /// The season buttons: the first eight, plus the season on screen when it sits past them (a
+    /// resume in season 12, or a pick from the list). Without it no button read as
+    /// selected while the strip showed that season (bp-season-menu's trigger names the active one).
+    private var seasonChips: [Int] {
+        var out = Array(model.seasons.prefix(8))
+        if model.seasons.contains(model.season), !out.contains(model.season) { out.append(model.season) }
+        return out
+    }
+
+    /// What the strip parks on: its first card and count, and the hinted / resume episode.
+    private var stripParkKey: String {
+        let strip = model.seasonEpisodes
+        var key = "\(strip.first?.id ?? ""):\(strip.count)"
+        if let t = model.stripTarget { key += ":\(t.season):\(t.episode)" }
+        return key
+    }
+
+    private var episodes: some View {
+        VStack(alignment: .leading, spacing: BP.px(12)) {
+            if model.metaFailed, model.episodes.isEmpty {
+                // bp-detail's BpPageMessage when the title can't be read.
+                VStack(alignment: .leading, spacing: BP.px(10)) {
+                    BPNote(text: "Couldn't load this title.")
+                    Button("Try again") {
+                        // The button leaves with the message once the meta is
+                        // in: the ring goes to Play instead of wherever tvOS drops it (see the
+                        // onChange below; load() itself runs on through extras and art for seconds).
+                        retryHandsPlay = true
+                        Task {
+                            await model.load()
+                            retryHandsPlay = false
+                        }
+                    }
+                    .buttonStyle(BPActionStyle())
+                }
+                .focusSection()
+            }
+            if model.animeSeasonKey != nil {
+                animeSeasonChips
+            } else if model.seasons.count > 1 {
+                HStack(spacing: BP.px(8)) {
+                    ForEach(seasonChips, id: \.self) { s in
+                        Button(s == 0 ? T("Specials") : T("Season %lld", s)) { model.pickKitsuSeason(s) }
+                            .buttonStyle(BPActionStyle(primary: model.season == s))
+                            .bpSelected(model.season == s)
+                            .focused($seasonFocus, equals: "kitsu-\(s)")
+                    }
+                    // bp-season-menu: long runs open the scrollable list instead of a chip wall.
+                    if model.seasons.count > 8 {
+                        Button("All \(model.seasons.count) seasons") { seasonsSheet = true }.buttonStyle(BPActionStyle())
+                            .focused($seasonFocus, equals: "kitsu-all")
+                    }
+                }
+                .focusSection()
+            } else if !model.seasons.isEmpty {
+                // bp-episodes.tsx: one season has no season chips
+                // (BpEpisodeSeasonChips returns null at seasons.length <= 1), only BpEpisodesHeading
+                // over the strip. A lone "Season 1" button did nothing and was one more Down press
+                // between Play and the episodes.
+                Text(T("Episodes")).font(BP.sans(16, .bold)).foregroundStyle(BP.ink)
+                    .accessibilityAddTraits(.isHeader)
+            }
+            ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: BP.trackGap) {
+                    ForEach(model.seasonEpisodes) { ep in
+                        // use-bp-detail play(ep, fromStrip): the strip fires like Play when instant play is on.
+                        Button { pickerAuto = SettingsBridge.shared.slice.instantPlay ?? true; pickerPref = true; picker = (model.meta, ep.playEpisode) } label: {
+                            EpisodeCell(episode: ep, watched: model.isWatched(ep), fact: model.fact(for: ep), chain: model.stillChain(for: ep), backdrop: model.meta.background,
+                                        spoiler: model.spoilerMask(for: ep), showRating: model.showEpisodeRating, showDescription: model.showEpisodeDescription,
+                                        progress: model.progress(for: ep))
+                        }
+                            .buttonStyle(BPTileStyle(lift: 1.05, edge: false))
+                            .focused($stripFocus, equals: ep.id)
+                            .bpProgressValue(model.progress(for: ep))
+                            // episode-watched-menu.tsx on hold-Select, plus use-mark-season's season toggle.
+                            .contextMenu { episodeWatchedMenu(ep) }
+                            .id(ep.id)
+                            .accessibilityIdentifier("episode-\(ep.season)-\(ep.episode)")
+                    }
+                }
+                .padding(.vertical, BP.px(14))
+            }
+            .scrollClipDisabled()
+            // use-bp-episode-strip: land on the hinted (AI search pick) or resume episode when the strip first shows.
+            // Keyed by the strip's first card too: the hint's season can replace the resume season with the same count.
+            // And by the target itself: the resume point is read after the episodes are in,
+            // so a resume in the season already on screen (every one-season show) never parked the strip.
+            // useBpParkedTrack: never while the ring is in the strip (the viewer's own spot wins).
+            .onChange(of: stripParkKey) { _, _ in
+                guard stripFocus == nil else { return }
+                // An anime chip can hold several Kitsu seasons, so the card is found by its own pair.
+                let strip = model.seasonEpisodes
+                guard let firstCard = strip.first else { return }
+                let s = model.stripTarget?.season, e = model.stripTarget?.episode
+                let target: DetailModel.Episode? = strip.first(where: { $0.season == s && $0.episode == e })
+                // A season without the target opens at its first card: the
+                // strip kept the last season's scroll, so after scrolling to E20 of one season the
+                // next opened on its late episodes (or blank space past a short season's end).
+                let id: String = (target ?? firstCard).id
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { withAnimation { proxy.scrollTo(id, anchor: .leading) } }
+            }
+            }
+            .focusSection()
+        }
+        // Review 31: the TVDB chips replace the Kitsu season buttons under the viewer's focus. The
+        // focused button vanishes first (focus falls to nil), so a loss in the last moment counts too;
+        // focus lands on the chip that opened (seeded from the viewer's Kitsu pick) and stays in the row.
+        .onChange(of: seasonFocus) { old, new in
+            if new == nil, old?.hasPrefix("kitsu-") == true { kitsuFocusLostAt = Date() }
+        }
+        // Try again hands the ring to Play the moment its message goes, not when the
+        // whole load returns: that waited on extras and episode art, and took the ring back from a
+        // viewer who had moved on meanwhile.
+        .onChange(of: model.metaFailed && model.episodes.isEmpty) { _, failing in
+            guard !failing, retryHandsPlay else { return }
+            retryHandsPlay = false
+            heroFocus = "play"
+        }
+        .onChange(of: model.animeSeasonKey) { old, new in
+            guard old == nil, let new, model.animeHasChips, model.animeChips.count > 1 else { return }
+            let wasOnKitsu = seasonFocus?.hasPrefix("kitsu-") == true
+                || (kitsuFocusLostAt.map { Date().timeIntervalSince($0) < 0.1 } ?? false)   // the same update, not a move away
+            kitsuFocusLostAt = nil
+            guard wasOnKitsu else { return }
+            DispatchQueue.main.async { seasonFocus = "chip-\(new)" }
+        }
+    }
+
+    /// bp-anime-seasons.tsx BpAnimeSeasonChips: the Episodes heading, then named season chips (year
+    /// span and episode count under the name; specials and extras last behind a divider) and the
+    /// TVDB order toggle on one track, so the strip stays one D-pad step below.
+    private var animeSeasonChips: some View {
+        VStack(alignment: .leading, spacing: BP.px(6)) {
+            // BpEpisodesHeading: "Episodes" and the strip's count.
+            HStack(alignment: .firstTextBaseline, spacing: BP.px(10)) {
+                Text(T("Episodes")).font(BP.sans(16, .bold)).foregroundStyle(BP.ink)
+                let n = model.seasonEpisodes.count
+                if n > 0 { Text(T("%lld episodes", n)).font(BP.sans(12, .semibold)).monospacedDigit().foregroundStyle(BP.inkSubtle) }
+            }
+            if model.animeHasChips {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: BP.px(6)) {
+                        let hasSeasons = model.animeChips.count > 1
+                        let hasOrders = model.animeOrders.count > 1
+                        if hasSeasons {
+                            ForEach(model.animeChips) { c in
+                                if c.divider { AnimeChipDivider() }
+                                Button { model.selectAnimeSeason(c.key) } label: { AnimeSeasonChipLabel(chip: c, selected: c.key == model.animeSeasonKey) }
+                                    .buttonStyle(AnimeSeasonChipStyle(selected: c.key == model.animeSeasonKey))
+                                    .focused($seasonFocus, equals: "chip-\(c.key)")
+                                    .accessibilityIdentifier("anime-season-\(c.key)")
+                                    .bpSelected(c.key == model.animeSeasonKey)
+                            }
+                        }
+                        if hasSeasons && hasOrders { AnimeChipDivider() }
+                        if hasOrders {
+                            Text(T("Order")).font(BP.sans(11, .bold)).textCase(.uppercase).tracking(BP.px(1.5)).foregroundStyle(BP.inkSubtle)
+                                .padding(.trailing, BP.px(2))
+                            ForEach(model.animeOrders) { o in
+                                Button(o.short) { Task { await model.setAnimeOrder(o.value) } }
+                                    .buttonStyle(PlayerChipStyle(on: o.value == model.animeOrderType))
+                                    .accessibilityIdentifier("anime-order-\(o.value)")
+                                    .bpSelected(o.value == model.animeOrderType)
+                            }
+                        }
+                    }
+                    .padding(.vertical, BP.px(14))
+                }
+                .scrollClipDisabled()
+                .focusSection()
+            }
+        }
+    }
+
+    /// components/episode-watched-menu.tsx: a watched episode offers "Mark as unwatched"; an
+    /// unwatched one "Mark as watched" and "Mark watched up to here", plus "Mark as unwatched" once
+    /// it has been started. The season item is episode-grid-controls OptionsMenu (use-mark-season).
+    @ViewBuilder
+    private func episodeWatchedMenu(_ ep: DetailModel.Episode) -> some View {
+        if model.isWatched(ep) {
+            Button { Task { await model.markWatched(ep, .episode, watched: false) } } label: { Label(T("Mark as unwatched"), systemImage: "eye.slash") }
+        } else {
+            Button { Task { await model.markWatched(ep, .episode, watched: true) } } label: { Label(T("Mark as watched"), systemImage: "checkmark") }
+            Button { Task { await model.markWatched(ep, .upTo, watched: true) } } label: { Label(T("Mark watched up to here"), systemImage: "eye") }
+            if model.isStarted(ep) {
+                Button { Task { await model.markWatched(ep, .episode, watched: false) } } label: { Label(T("Mark as unwatched"), systemImage: "eye.slash") }
+            }
+        }
+        if model.seasonAllWatched {
+            Button { Task { await model.markWatched(ep, .season, watched: false) } } label: { Label(T("Mark season as unwatched"), systemImage: "eye.slash") }
+        } else {
+            Button { Task { await model.markWatched(ep, .season, watched: true) } } label: { Label(T("Mark season as watched"), systemImage: "checkmark.circle") }
+        }
+    }
+}
+
+/// bp-detail-actions BpSecondaryAction: a square icon cell, `on` face when active, edge border otherwise.
+struct DetailIconActionStyle: ButtonStyle {
+    var active = false
+    func makeBody(configuration: Configuration) -> some View {
+        BPFocusReader { focused in
+            configuration.label
+                .font(.system(size: BP.px(17), weight: .semibold))
+                .foregroundStyle(BP.ink)
+                .frame(width: BP.tabItem, height: BP.tabItem)
+                .background(RoundedRectangle(cornerRadius: BP.rXS, style: .continuous).fill(active || focused ? BP.on : Color.clear))
+                .overlay(RoundedRectangle(cornerRadius: BP.rXS, style: .continuous).stroke(active ? Color.clear : BP.edge2, lineWidth: 1))
+                .modifier(BPFocusModifier(focused: focused, pressed: configuration.isPressed, radius: BP.rXS, lift: 1.02))
+        }
+    }
+}
+
+/// bp-status-dialog.tsx: the tracker's statuses (the current one lit and ticked), Close, and
+/// "Remove from list" when there is an entry. Select sets the status and closes.
+struct TrackerDialogView: View {
+    let tracker: DetailModel.Tracker
+    let onPick: (String) -> Void
+    let onRemove: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var focus: String?
+
+    var body: some View {
+        ZStack {
+            BP.void_.opacity(0.78).ignoresSafeArea()
+            VStack(alignment: .leading, spacing: BP.px(18)) {
+                Text(tracker.name).font(BP.display(26)).foregroundStyle(BP.ink)
+                VStack(alignment: .leading, spacing: BP.px(8)) {
+                    ForEach(tracker.choices) { c in
+                        Button { onPick(c.id); dismiss() } label: {
+                            HStack {
+                                Text(T(c.label))
+                                Spacer()
+                                if c.id == tracker.status { Image(systemName: "checkmark").accessibilityHidden(true) }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(BPActionStyle(primary: c.id == tracker.status)).bpSelected(c.id == tracker.status)
+                        .focused($focus, equals: c.id)
+                    }
+                }
+                .focusSection()
+                HStack(spacing: BP.px(10)) {
+                    Button("Close") { dismiss() }.buttonStyle(BPActionStyle())
+                    if tracker.canRemove {
+                        Button { onRemove(); dismiss() } label: { Label("Remove from list", systemImage: "trash") }.buttonStyle(BPActionStyle())
+                    }
+                }
+                .focusSection()
+            }
+            .padding(BP.px(36))
+            .frame(width: BP.px(760), alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: BP.rLG, style: .continuous).fill(BP.panel))
+            .overlay(RoundedRectangle(cornerRadius: BP.rLG, style: .continuous).stroke(BP.edge2, lineWidth: 1))
+        }
+        .onExitCommand { dismiss() }
+        .task {
+            // Seed focus on the current status, else the first choice.
+            try? await Task.sleep(for: .milliseconds(100))
+            focus = tracker.status ?? tracker.choices.first?.id
+        }
+    }
+}
+
+/// bp-episode-still.tsx BpEpisodeStill: walks the still ladder and lands on the numbered plate
+/// (the series backdrop dimmed behind the episode number) once every url has failed.
+struct EpisodeStill: View {
+    let chain: [String]
+    let label: Int
+    var backdrop: String?
+    @State private var image: UIImage?
+    @State private var exhausted = false
+    @Environment(\.displayScale) private var displayScale
+    /// EpisodeCell's still box (230 x 129 at the 1140 canvas). The ladder was decoded
+    /// with no size, so at ImageLoader's 1920 px default: TVDB, ani.zip and metahub stills come at
+    /// 780 px to full HD, 1.4 to 8 MB each decoded for a card a fifth of the screen wide, and a
+    /// season strip of them could fill the whole image cache on an Apple TV HD.
+    private static let box = CGSize(width: BP.px(230), height: (BP.px(230) * 9 / 16).rounded())
+
+    var body: some View {
+        ZStack {
+            BP.panel2
+            if let image {
+                Image(uiImage: image).resizable().aspectRatio(contentMode: .fill).transition(.opacity).accessibilityHidden(true)
+            } else if exhausted {
+                if let backdrop {
+                    RemoteImage(url: backdrop).opacity(0.25).saturation(0.6)
+                    BP.void_.opacity(0.6)
+                }
+                Text("\(label)").font(BP.display(40)).monospacedDigit().foregroundStyle(BP.ink).opacity(0.6)
+            }
+        }
+        .task(id: chain.joined(separator: "|")) {
+            image = nil
+            exhausted = false
+            let scale: Double = Double(max(1, displayScale))
+            let target = ImageLoader.Target(width: Int((Double(Self.box.width) * scale).rounded(.up)),
+                                            height: Int((Double(Self.box.height) * scale).rounded(.up)))
+            for url in chain {
+                guard let u = URL(string: url) else { continue }
+                if let img = await ImageLoader.shared.image(for: u, target: target) {
+                    withAnimation(BP.easeFast) { image = img }
+                    return
+                }
+                if Task.isCancelled { return }
+            }
+            exhausted = true
+        }
+    }
+}
+
+/// bp-anime-season-chip.tsx BpAnimeSeasonChip: BpChip's pill one line taller, the season's name
+/// (and an OVA / Movie / Special badge when one comes) over its years and episode count.
+struct AnimeSeasonChipLabel: View {
+    let chip: DetailModel.AnimeSeasonChip
+    let selected: Bool
+    /// The chip button's focus: group-data-[bp-focus=true] turns both lines to the canvas colour.
+    @Environment(\.isFocused) private var focused
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: BP.px(1)) {
+            HStack(spacing: BP.px(4)) {
+                Text(chip.name).font(BP.sans(14, .semibold)).lineLimit(1).frame(maxWidth: BP.px(250), alignment: .leading)
+                if let badge = chip.badge, !badge.isEmpty {
+                    Text(badge).font(BP.sans(10, .bold)).textCase(.uppercase).tracking(BP.px(1.2))
+                        .padding(.horizontal, BP.px(5)).padding(.vertical, BP.px(1))
+                        .background(Capsule().fill(BP.void_.opacity(focused ? 0.25 : 0.45)))
+                }
+            }
+            .foregroundStyle(focused ? BP.canvas : (selected ? BP.ink : BP.inkSubtle))
+            if !chip.meta.isEmpty {
+                Text(chip.meta).font(BP.sans(12, .medium)).monospacedDigit().lineLimit(1)
+                    .foregroundStyle(focused ? BP.canvas : BP.inkMuted)
+            }
+        }
+        .padding(.horizontal, BP.px(13))
+        .padding(.vertical, BP.px(5))
+        .frame(minHeight: BP.px(43))
+    }
+}
+
+/// BpAnimeSeasonChip faces: the picked season sits on the void, the rest are an edge hairline; focus floods ink.
+struct AnimeSeasonChipStyle: ButtonStyle {
+    var selected: Bool
+    func makeBody(configuration: Configuration) -> some View {
+        BPFocusReader { focused in
+            configuration.label
+                // The selected chip was a dark fill on the dark page, so it read as
+                // bare text while the others had outlines: the picked season looked unpicked. Now it is
+                // the lit one, like the order chips beside it.
+                .background(RoundedRectangle(cornerRadius: BP.rLG, style: .continuous).fill(focused ? BP.ink : (selected ? BP.ink.opacity(0.16) : Color.clear)))
+                .overlay(RoundedRectangle(cornerRadius: BP.rLG, style: .continuous).stroke(focused ? Color.clear : (selected ? BP.ink.opacity(0.4) : BP.edge), lineWidth: 1))
+                .modifier(BPFocusModifier(focused: focused, pressed: configuration.isPressed, radius: BP.rLG, lift: 1.02))
+        }
+    }
+}
+
+/// bp-library-chips.tsx BpChipDivider: a hairline between chip groups.
+struct AnimeChipDivider: View {
+    var body: some View {
+        Rectangle().fill(BP.edge2).frame(width: 1, height: BP.px(26)).padding(.horizontal, BP.px(4))
+    }
+}
+
+struct EpisodeCell: View {
+    let episode: DetailModel.Episode
+    var watched = false
+    var fact: DetailModel.EpisodeFact? = nil
+    /// use-bp-episode-art ladder; nil draws the Cinemeta thumbnail alone.
+    var chain: [String]? = nil
+    var backdrop: String? = nil
+    /// lib/spoilers.ts spoilerMaskFor for this card; nil shows everything.
+    var spoiler: DetailModel.SpoilerMask? = nil
+    /// bp-episode-card.tsx: settings.showEpisodeRating / showEpisodeDescription !== false.
+    var showRating = true
+    var showDescription = true
+    /// bp-episode-card.tsx progress: the resume episode's bar along the still's bottom edge (0.01–0.97).
+    var progress: Double = 0
+    /// The episode button's focus (the nearest focusable ancestor): bp-episode-still BP_SPOILER_THUMB /
+    /// BP_SPOILER_TEXT lift the blur on focus, since a remote has no hover to reveal it.
+    @Environment(\.isFocused) private var focused
+    private static let size = CGSize(width: BP.px(230), height: (BP.px(230) * 9 / 16).rounded())
+
+    private var hideThumb: Bool { spoiler?.thumb == true && !focused }
+    private var hideTitle: Bool { spoiler?.title == true && !focused }
+    private var hideDesc: Bool { spoiler?.desc == true && !focused }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: BP.px(6)) {
+            ZStack(alignment: .bottomLeading) {
+                EpisodeStill(chain: chain ?? episode.thumbnail.map { [$0] } ?? [], label: episode.episode, backdrop: backdrop)
+                    // BP_SPOILER_THUMB: blur-[16px] scale-[1.05], back to sharp on focus.
+                    .blur(radius: hideThumb ? BP.px(16) : 0)
+                    .scaleEffect(hideThumb ? 1.05 : 1)
+                    .animation(BP.easeFast, value: hideThumb)
+                LinearGradient(colors: [.clear, BP.void_.opacity(0.85)], startPoint: .center, endPoint: .bottom)
+                HStack(spacing: BP.px(6)) {
+                    Text(episode.tag ?? "E\(episode.episode)").font(BP.sans(12, .bold)).foregroundStyle(BP.ink)
+                    // bp-anime-seasons.tsx: t("Filler") beside the episode tag.
+                    if episode.filler {
+                        Text(verbatim: T("Filler")).font(BP.sans(9.8, .bold)).textCase(.uppercase).tracking(1).foregroundStyle(BP.ink)
+                            .padding(.horizontal, BP.px(6)).padding(.vertical, BP.px(1))
+                            .background(Capsule().fill(BP.void_.opacity(0.82)))
+                    }
+                }
+                .padding(BP.px(8))
+                // use-bp-episode-facts chip: rating (IMDb mark when it is IMDb's) and runtime.
+                if let f = fact, (f.rating != nil && showRating) || f.runtime != nil {
+                    HStack(spacing: BP.px(4)) {
+                        if let r = f.rating, showRating { Text((f.ratingIsImdb ? "IMDb " : "★ ") + String(format: "%.1f", r)) }
+                        if let m = f.runtime { Text("\(m) min") }
+                    }
+                    .font(BP.sans(9.5, .bold)).foregroundStyle(BP.ink)
+                    .padding(.horizontal, BP.px(6)).padding(.vertical, BP.px(3))
+                    .background(RoundedRectangle(cornerRadius: BP.px(4)).fill(BP.void_.opacity(0.85)))
+                    .padding(BP.px(8))
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                if watched {
+                    Image(systemName: "checkmark").font(.system(size: BP.px(10), weight: .bold)).foregroundStyle(BP.canvas)
+                        .accessibilityLabel(Text(T("Watched")))
+                        .frame(width: BP.px(21), height: BP.px(21)).background(Circle().fill(BP.ink))
+                        .padding(BP.px(7)).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                }
+                if let d = episode.released, d > Date() {
+                    Text("Unaired").font(BP.sans(9.8, .bold)).textCase(.uppercase).foregroundStyle(BP.canvas)
+                        .padding(.horizontal, BP.px(6)).padding(.vertical, BP.px(2)).background(RoundedRectangle(cornerRadius: BP.px(4)).fill(BP.ink))
+                        .padding(BP.px(7)).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
+                // The strip never showed where the viewer stopped inside an episode.
+                if progress > 0.01, progress < 0.97 {
+                    ZStack(alignment: .leading) {
+                        BP.void_.opacity(0.6)
+                        BP.accent.frame(width: Self.size.width * progress)
+                    }
+                    .frame(width: Self.size.width, height: BP.px(3))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                    .accessibilityHidden(true)
+                }
+            }
+            .frame(width: Self.size.width, height: Self.size.height)
+            .clipShape(RoundedRectangle(cornerRadius: BP.rXS, style: .continuous))
+            // The focus edge hugs the still, as tvOS draws it on an episode; the
+            // title and overview under it lift with the cell but stay outside the frame.
+            .overlay(RoundedRectangle(cornerRadius: BP.rXS, style: .continuous).stroke(Color.white.opacity(focused ? 0.85 : 0), lineWidth: 2.5))
+            Text(episode.title).font(BP.sans(12, .semibold)).foregroundStyle(BP.ink).lineLimit(1)
+                .blur(radius: hideTitle ? BP.px(6) : 0)
+                .animation(BP.easeFast, value: hideTitle)
+            // bp-anime-seasons.tsx facts: "Abs E{n}" (absolute order renumbers the run) · the air date.
+            let facts = [episode.absoluteLabel, episode.released.map { $0.formatted(date: .abbreviated, time: .omitted) }].compactMap { $0 }
+            if !facts.isEmpty { Text(facts.joined(separator: " · ")).font(BP.sans(11)).monospacedDigit().foregroundStyle(BP.inkSubtle).lineLimit(1) }
+            // bp-episode-card.tsx: the overview, two lines, when showEpisodeDescription is on.
+            if showDescription, let o = episode.overview, !o.isEmpty {
+                Text(o).font(BP.sans(11)).foregroundStyle(BP.inkSubtle).lineLimit(2).lineSpacing(2)
+                    .blur(radius: hideDesc ? BP.px(6) : 0)
+                    .animation(BP.easeFast, value: hideDesc)
+            }
+        }
+        .frame(width: Self.size.width, alignment: .leading)
+    }
+}
+
+/// detail/bp-hero-notes.tsx BpHeroMarks addon mark: the addon's own logo (when it ships one) and its
+/// name in BP_METRIC_CHIP at 0.86em, so a title served by the viewer's addon does not read as a
+/// Cinemeta record.
+struct AddonOriginMark: View {
+    let origin: Meta.AddonOrigin
+
+    var body: some View {
+        HStack(spacing: BP.px(6)) {
+            if let logo = origin.logo {
+                RemoteImage(url: logo, contentMode: .fit)
+                    .frame(width: BP.px(15), height: BP.px(15))
+                    .clipShape(RoundedRectangle(cornerRadius: BP.px(5), style: .continuous))
+                    .accessibilityHidden(true)
+            }
+            Text(verbatim: origin.name).font(BP.sans(11.5, .bold)).foregroundStyle(BP.ink).lineLimit(1)
+        }
+        .padding(.horizontal, BP.px(7)).padding(.vertical, BP.px(4))
+        .background(RoundedRectangle(cornerRadius: BP.px(10), style: .continuous).fill(BP.void_.opacity(0.85)))
+        .overlay(RoundedRectangle(cornerRadius: BP.px(10), style: .continuous).stroke(BP.edge2, lineWidth: 1))
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// detail/bp-hero-notes.tsx BpHeroMarks home-server mark: the provider's glyph (media-server-brand.tsx
+/// ProviderMark, drawn from its 24-unit paths) in BP_METRIC_CHIP, named "Available in {name}".
+struct MediaServerMark: View {
+    let server: DetailModel.TitleServer
+
+    var body: some View {
+        glyph
+            .frame(width: BP.px(18), height: BP.px(18))
+            .padding(.horizontal, BP.px(7)).padding(.vertical, BP.px(4))
+            .background(RoundedRectangle(cornerRadius: BP.px(10), style: .continuous).fill(BP.void_.opacity(0.85)))
+            .overlay(RoundedRectangle(cornerRadius: BP.px(10), style: .continuous).stroke(BP.edge2, lineWidth: 1))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(verbatim: T("Available in %@", server.providerName)))
+    }
+
+    @ViewBuilder private var glyph: some View {
+        if server.provider == "plex" {
+            MarkPolygon(points: [(7, 2), (13.2, 2), (21, 12), (13.2, 22), (7, 22), (14.8, 12)])
+                .fill(Color(red: 0.898, green: 0.627, blue: 0.051))
+        } else if server.provider == "emby" {
+            ZStack {
+                MarkPolygon(points: [(12, 1), (21.5, 6.5), (21.5, 17.5), (12, 23), (2.5, 17.5), (2.5, 6.5)])
+                    .fill(Color(red: 0.322, green: 0.710, blue: 0.294))
+                MarkPolygon(points: [(9, 7), (16, 12), (9, 17)]).fill(Color.white)
+            }
+        } else {
+            ZStack {
+                MarkPolygon(points: [(12, 2), (23, 21), (1, 21)]).fill(Color(red: 0.667, green: 0.361, blue: 0.765))
+                MarkPolygon(points: [(12, 8), (17.2, 17), (6.8, 17)]).fill(Color(red: 0.090, green: 0.090, blue: 0.090))
+                MarkPolygon(points: [(12, 12.1), (14.8, 17), (9.2, 17)]).fill(Color(red: 0.667, green: 0.361, blue: 0.765))
+            }
+        }
+    }
+}
+
+/// A closed polygon in a 24 x 24 box (media-server-brand.tsx's viewBox), scaled to the frame.
+struct MarkPolygon: Shape {
+    let points: [(CGFloat, CGFloat)]
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        guard let first = points.first else { return path }
+        let sx: CGFloat = rect.width / 24
+        let sy: CGFloat = rect.height / 24
+        path.move(to: CGPoint(x: rect.minX + first.0 * sx, y: rect.minY + first.1 * sy))
+        for point in points.dropFirst() {
+            path.addLine(to: CGPoint(x: rect.minX + point.0 * sx, y: rect.minY + point.1 * sy))
+        }
+        path.closeSubpath()
+        return path
+    }
+}
+
+/// bp-cast-row cell: the portrait lifts with its own ring and shadow; the name brightens.
+private struct CastCell: View {
+    let person: DetailModel.Extras.Cast
+    @Environment(\.isFocused) private var focused
+    @Environment(\.bpPortraitPressed) private var pressed
+
+    var body: some View {
+        VStack(spacing: BP.px(8)) {
+            ZStack {
+                Circle().fill(BP.panel2)
+                // bp-cast-row.tsx img alt="": the name and character below already name the cell.
+                if let p = person.profile { RemoteImage(url: p).clipShape(Circle()).accessibilityHidden(true) } else { Image(systemName: "person.fill").font(.system(size: BP.px(30))).foregroundStyle(BP.inkSubtle).accessibilityHidden(true) }
+            }
+            .frame(width: BP.px(110), height: BP.px(110))
+            .overlay(Circle().stroke(Color.white.opacity(focused ? 0.85 : 0), lineWidth: 2.5))
+            .shadow(color: .black.opacity(focused ? 0.6 : 0), radius: focused ? 12 : 0, y: focused ? 6 : 0)
+            .scaleEffect(focused ? (pressed ? 1.1 * BP.press : 1.1) : 1)
+            // The lifted portrait and its shadow ran over the character line: both lines
+            // drop clear of it and draw above it.
+            Group {
+                Text(person.name).font(BP.sans(12, .semibold)).foregroundStyle(focused ? BP.ink : BP.inkMuted).lineLimit(1)
+                Text(person.character).font(BP.sans(10)).foregroundStyle(BP.inkSubtle).lineLimit(1)
+            }
+            .offset(y: focused ? BP.px(7) : 0)
+            .zIndex(1)
+        }
+        .frame(width: BP.px(130))
+        .animation(BP.ease, value: focused)
+    }
+}

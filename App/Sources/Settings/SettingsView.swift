@@ -1,0 +1,405 @@
+import SwiftUI
+
+/// Settings room, accounts, profiles, developer, about.
+struct SettingsView: View {
+    @EnvironmentObject private var app: AppModel
+    @EnvironmentObject private var profiles: ProfilesStore
+    @State private var sheet: Sheet?
+    @State private var pinDraft = ""
+    @State private var tmdbTesting = false
+    @State private var tmdbTestNote: String?
+    /// Whether tmdbTestNote reports a success (tinted live); set with it, like LetterboxdPanel.
+    @State private var tmdbTestOk = false
+    /// Counts closed covers, so the column above re-reads what a sign-in or key change did.
+    @State private var coversClosed = 0
+    /// The Artwork and rows section's first button (Connect TMDB / Use a different key).
+    @FocusState private var tmdbLead: Bool
+    /// The Stremio section's Sign in ("stremio"). Sign out
+    /// asks nothing first, like upstream (account-identity-card / stremio-card signOut), and takes
+    /// its own button away; the ring follows to Sign in (stremio-card returnRing → signInRef).
+    @FocusState private var accountLead: String?
+    /// The cover that just closed (read in its onDismiss, when `sheet` is nil).
+    @State private var closingSheet: Sheet?
+    /// Replay walkthrough ("replay") or Switch profile ("switch") took the app
+    /// off the shell: the rebuilt page returns the ring to that button. Only
+    /// when no profile switch came in between (`AppModel.profileSwitches`): a pick of another profile
+    /// opens Home (use-bp-profile-reset), and the key waited for some later Settings visit.
+    private static var ringReturn: (key: String, serial: Int)?
+    @FocusState private var returnFocus: String?
+    /// Edit Home, opened from the Home rows section.
+    @State private var homeEditing = false
+
+    @EnvironmentObject private var settings: SettingsBridge
+    @ObservedObject private var tmdbHealth = TmdbHealth.shared
+    enum Sheet: Identifiable { case stremio, pin, removePin, spikes, tmdb, addons, subLangs, newProfile, editProfile, manageProfiles, connect; var id: Int { hashValue } }
+
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: BP.px(28)) {
+                Text("Settings").font(BP.display(36)).foregroundStyle(BP.ink)
+                BPSettingsView(openConnect: { sheet = .connect }, refresh: coversClosed)
+                    .padding(.bottom, BP.px(10))
+                // settings-sidebar.tsx "LOOK & FEEL" → Appearance (theme-panel.tsx).
+                section("Appearance") { AppearancePanel() }
+                // chrome/nav-edit.tsx in-place sidebar editing, for the top bar (Settings/TabsPanel.swift).
+                section("Tabs") { TabsPanel() }
+                section("Stremio") {
+                    if let p = profiles.active {
+                        if let s = profiles.stremioSession(for: p.id) {
+                            row(Self.stremioLine(s.user.fullname, s.user.email), detail: T("For the %@ profile", p.name))
+                            // The column's Setup summary, "Accounts and TMDB" detail
+                            // and preview name the Stremio account (engine settingsRoom facts): they are
+                            // read again, as a sign-in's closing cover already has them (bp-settings
+                            // reads live); they said "Connected: Stremio" after the sign-out.
+                            Button("Sign out") { profiles.setStremioSession(nil, for: p.id); coversClosed &+= 1; returnRing(to: "stremio") }.buttonStyle(BPActionStyle())
+                                .focused($accountLead, equals: "stremio-out")
+                        } else {
+                            row("Not signed in", detail: T("Your Stremio library for the %@ profile", p.name))
+                            Button("Sign in") { sheet = .stremio }.buttonStyle(BPActionStyle(primary: true))
+                                .focused($accountLead, equals: "stremio")
+                        }
+                    }
+                }
+                section("Trakt") { TraktPanel() }
+                section("Simkl") { TraktPanel(service: "simkl", label: "Simkl") }
+                section("AniList") { PasteTrackerPanel(service: "anilist", label: "AniList") }
+                section("MyAnimeList") { PasteTrackerPanel(service: "mal", label: "MyAnimeList") }
+                section("Letterboxd") { LetterboxdPanel() }
+                section("Home servers") { HomeServersPanel() }
+                section("Addons") {
+                    row("Stream and catalog addons", detail: "Installed on this TV plus the ones on your Stremio account")
+                    Button("Manage addons") { sheet = .addons }.buttonStyle(BPActionStyle(primary: true))
+                    StreamPriorityPanel()
+                }
+                section("Artwork and rows") {
+                    row(settings.slice.tmdbKey.isEmpty ? "Running on Cinemeta" : (tmdbHealth.rejected ? T("TMDB refused the saved key") : "TMDB key saved"),
+                        detail: settings.slice.tmdbKey.isEmpty ? "Add a free TMDB key for Trending, In Theaters, Top Rated and service rows" : T("Saved on this device only (%lld characters)", settings.slice.tmdbKey.count))
+                    HStack(spacing: BP.px(12)) {
+                        Button(settings.slice.tmdbKey.isEmpty ? "Connect TMDB" : "Use a different key") { sheet = .tmdb }.buttonStyle(BPActionStyle(primary: settings.slice.tmdbKey.isEmpty))
+                            .focused($tmdbLead)
+                        Button { sheet = .connect } label: { Label("Use your phone", systemImage: "iphone") }.buttonStyle(BPActionStyle())
+                        if !settings.slice.tmdbKey.isEmpty {
+                            Button(tmdbTesting ? "Testing…" : "Test saved key") { Task { await testSavedKey() } }.buttonStyle(BPActionStyle(busy: tmdbTesting))
+                            // Removing the key takes Test and Remove away with it:
+                            // the ring goes to Connect TMDB instead of jumping off the section, and a
+                            // failed save says so instead of doing nothing.
+                            Button("Remove key") {
+                                Task {
+                                    do {
+                                        try await settings.patch(["tmdbKey": .string("")])
+                                        tmdbTestNote = nil
+                                        tmdbLead = true
+                                    } catch {
+                                        tmdbTestNote = T("Failed: %@", error.localizedDescription)
+                                        tmdbTestOk = false
+                                    }
+                                }
+                            }
+                            .buttonStyle(BPActionStyle())
+                        }
+                    }
+                    if let tmdbTestNote { BPNote(text: tmdbTestNote, tone: tmdbTestOk ? BP.live : BP.danger) }
+                }
+                section("Playback") {
+                    row("Subtitle languages: \(settings.slice.preferredSubLangs.joined(separator: ", "))", detail: "First match wins when searching online subtitles")
+                    Button("Choose subtitle languages") { sheet = .subLangs }.buttonStyle(BPActionStyle())
+                    HStack(spacing: BP.px(8)) {
+                        onOff("Resume where you left off", settings.slice.resumePlayback ?? true, key: "resumePlayback")
+                        onOff("Ask before resuming", settings.slice.resumePrompt ?? false, key: "resumePrompt")
+                        onOff("Confirm before leaving the player", settings.slice.playerConfirmLeave ?? true, key: "playerConfirmLeave")
+                    }
+                    // No upstream key: a small on-screen readout the owner can
+                    // turn on to see the engine, source, mpv/AVPlayer state and the last log lines
+                    // directly on the TV, with no Mac to read them off the device otherwise.
+                    row("Player diagnostics overlay", detail: "Shows the player engine, source and the last mpv/AVPlayer log lines on screen. Turn on to check a stream that plays wrong.")
+                    onOff("Player diagnostics overlay", settings.slice.playerDiagnostics ?? false, key: "playerDiagnostics")
+                }
+                // views/settings/library-panel/detail-tab.tsx "Spoilers" section: the Detail page's
+                // episode strip already masks per lib/spoilers.ts (DetailView.EpisodeCell); this is
+                // where the viewer turns it on.
+                section("Spoilers") { SpoilersPanel() }
+                section("Anime4K") { Anime4KPanel() }
+                // settings.homeRows (lib/home-customization) and the Simkl home rails (Settings/HomeRowsPanel.swift).
+                section("Home rows") {
+                    // The profile's Home layout: which rows, from where, in what order.
+                    HStack(spacing: BP.px(12)) {
+                        Button { homeEditing = true } label: { Label(T("Edit Home layout"), systemImage: "square.grid.2x2") }
+                            .buttonStyle(BPActionStyle())
+                            .accessibilityIdentifier("settings-home-edit")
+                        Text(verbatim: T("Add, remove and reorder Home's rows and pick its hero, for this profile."))
+                            .font(BP.sans(14)).foregroundStyle(BP.inkMuted)
+                    }
+                    HomeRowsPanel()
+                }
+                section("Anime rows") { AnimeRowsPanel() }
+                // settings/webhooks-panel.tsx (sports reminders) and sports-api-setting.tsx.
+                section("Where alerts go") { SportsWebhooksPanel() }
+                section("Sports metadata") { SportsApiKeyPanel() }
+                section("Profiles") {
+                    if let p = profiles.active {
+                        row(p.name, detail: T("%lld profiles on this TV", profiles.profiles.count))
+                        HStack(spacing: BP.px(12)) {
+                            Button("Switch profile") {
+                                app.switchProfile()
+                                // Not from the Picture in Picture browse layer: its switch
+                                // takes the layer down and the main shell's Who's watching returns to
+                                // whatever room that shell was on, so the key waited for a later,
+                                // unrelated Settings visit and pulled the ring to Switch profile there.
+                                let fromLayer: Bool = PiPBrowse.shared.isBrowseApp(app)
+                                Self.ringReturn = app.stage == .whoIsWatching && !fromLayer ? (key: "switch", serial: app.profileSwitches) : nil
+                            }
+                            .buttonStyle(BPActionStyle())
+                            .focused($returnFocus, equals: "switch")
+                            // UI tests (NavigationTests6): reaching Guest's own advanced settings
+                            // needs it made active first, since Edit profile below only ever opens
+                            // `profiles.active`'s own editor.
+                            .accessibilityIdentifier("settings-switch-profile")
+                            Button(p.passwordHash == nil ? "Set a PIN" : "Remove PIN") {
+                                if p.passwordHash == nil { pinDraft = ""; sheet = .pin } else { sheet = .removePin }
+                            }.buttonStyle(BPActionStyle())
+                                .accessibilityIdentifier("settings-pin-button")
+                            Button("Edit profile") { sheet = .editProfile }.buttonStyle(BPActionStyle())
+                                .accessibilityIdentifier("settings-edit-profile")
+                            Button("Add profile") { sheet = .newProfile }.buttonStyle(BPActionStyle())
+                                .accessibilityIdentifier("settings-add-profile")
+                            // editor-view.tsx canEditAdvanced = activeIsPrimary, picker-modal.tsx
+                            // ListView canEditThis = isPrimary || own: the primary can open any
+                            // profile's own editor, not just its own ("Edit profile" above always
+                            // opens `profiles.active`). ManageProfilesView is that route.
+                            if p.isPrimary {
+                                Button("Manage profiles") { sheet = .manageProfiles }.buttonStyle(BPActionStyle())
+                                    .accessibilityIdentifier("settings-manage-profiles")
+                            }
+                        }
+                    }
+                }
+                // views/settings/account.tsx mounts StartupDefaults under the profiles; it renders
+                // nothing for a one-profile household (profiles.length <= 1).
+                if profiles.profiles.count > 1 {
+                    section("Startup & default") { StartupDefaultsPanel() }
+                }
+                section("Developer") {
+                    Button("Stage 0 spikes") { sheet = .spikes }.buttonStyle(BPActionStyle())
+                }
+                // advanced-panel/about-tab.tsx: the Onboarding section above About. "Replay
+                // walkthrough" re-opens setup (useOnboarding resetOnboarding); after "Do not show
+                // this again" it was the only way back in. Upstream's "Restore dismissed hints"
+                // row has nothing to restore on the TV (no dismissible tips), so it is not here.
+                // Not in the Picture in Picture browse layer: its model declines the
+                // replay (setup can't open over a film in PiP), so Replay there did nothing.
+                if !PiPBrowse.shared.isBrowseApp(app) {
+                    section("Onboarding") {
+                        row("Replay walkthrough", detail: "Re-runs the welcome flow and clears every dismissed tip.")
+                        Button {
+                            app.replayOnboarding()
+                            Self.ringReturn = app.stage == .onboarding ? (key: "replay", serial: app.profileSwitches) : nil
+                        } label: {
+                            Label(T("Replay"), systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(BPActionStyle())
+                        .focused($returnFocus, equals: "replay")
+                        .accessibilityIdentifier("settings-replay-walkthrough")
+                    }
+                }
+                section("About") {
+                    row("Harbor for Apple TV", detail: T("Build %@ · upstream beta-branch", build))
+                }
+            }
+            .padding(.horizontal, BP.gutter).padding(.top, BP.barHeight + BP.px(20)).padding(.bottom, BP.hintHeight + BP.px(20))
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .onAppear { if Fixtures.openSpikes && sheet == nil { sheet = .spikes } }
+        // Setup and Who's watching replace the shell, so leaving them (Start
+        // watching, Finish later, a pick, Back) builds Settings afresh and the ring started at the
+        // top of the page, far above the row it was on. bp-shell opens setup and the chooser over
+        // the room (bp-who-is-watching-layer) and the ring comes back to what opened them: Replay
+        // or Switch profile, once the page is laid out again.
+        .task {
+            guard let back = Self.ringReturn else { return }
+            Self.ringReturn = nil
+            guard back.serial == app.profileSwitches else { return }
+            let key: String = back.key
+            try? await Task.sleep(for: .milliseconds(350))
+            if sheet == nil { returnFocus = key }
+        }
+        .onChange(of: sheet) { old, now in
+            if now == nil { closingSheet = old }
+        }
+        .fullScreenCover(isPresented: $homeEditing) { HomeEditView(source: app.homeLayoutSource) }
+        .fullScreenCover(item: $sheet, onDismiss: {
+            coversClosed &+= 1
+            let closed: Sheet? = closingSheet
+            closingSheet = nil
+            afterCover(closed)
+        }) { which in
+            ZStack {
+                BPAmbientBackground()
+                switch which {
+                case .stremio:
+                    if let p = profiles.active {
+                        StremioSignInForm(profileId: p.id, done: { _ in sheet = nil }, skip: { sheet = nil }).padding(BP.gutter)
+                    }
+                case .removePin:
+                    // Removing a PIN needs that PIN, or it would unlock every locked tab.
+                    if let p = profiles.active {
+                        PinPadView(profile: p, finish: { ok in
+                            if ok { profiles.setPin(nil, for: p.id) }
+                            sheet = nil
+                        }, title: "Enter the PIN to remove it")
+                    }
+                case .pin:
+                    VStack(alignment: .leading, spacing: BP.px(16)) {
+                        Text("Set a 4-digit PIN").font(BP.display(30)).foregroundStyle(BP.ink)
+                        BPField(label: "PIN", placeholder: "4 digits", text: $pinDraft, secure: true, keyboard: .numberPad)
+                        HStack(spacing: BP.px(12)) {
+                            Button("Save") { if let p = profiles.active { profiles.setPin(pinDraft, for: p.id) }; sheet = nil }
+                                .buttonStyle(BPActionStyle(primary: true)).disabled(!ProfilesStore.isValidPin(pinDraft))
+                            Button("Cancel") { sheet = nil }.buttonStyle(BPActionStyle())
+                        }
+                        BPNote(text: "PINs stay on this Apple TV. They never sync.")
+                    }
+                    .frame(maxWidth: BP.px(520)).padding(BP.gutter)
+                case .tmdb:
+                    VStack(alignment: .leading, spacing: BP.px(16)) {
+                        Text("Connect TMDB").font(BP.display(30)).foregroundStyle(BP.ink)
+                        TmdbKeyForm(done: { sheet = nil }, skip: { sheet = nil })
+                    }
+                    .padding(BP.gutter)
+                case .addons:
+                    AddonsView()
+                case .connect:
+                    ConnectPane(onBack: { sheet = nil })
+                case .newProfile:
+                    ProfileEditorView(editing: nil, dismiss: { sheet = nil })
+                case .editProfile:
+                    ProfileEditorView(editing: profiles.active, dismiss: { sheet = nil })
+                case .manageProfiles:
+                    ManageProfilesView(dismiss: { sheet = nil })
+                case .subLangs:
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: BP.px(12)) {
+                            Text("Which subtitle languages, in order?").font(BP.display(30)).foregroundStyle(BP.ink)
+                            BPNote(text: "First match wins. Most people need only one. Pick again to remove.")
+                            SubtitleLanguageGrid()
+                            Button("Done") { sheet = nil }.buttonStyle(BPActionStyle(primary: true))
+                        }
+                        .padding(BP.gutter)
+                    }
+                case .spikes:
+                    SpikeMenuView()
+                }
+            }
+            .environmentObject(app).environmentObject(profiles).environmentObject(settings)
+        }
+    }
+
+    /// The section's Sign in, once the sign-out has put it on screen.
+    private func returnRing(to key: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { accountLead = key }
+    }
+
+    /// A sign-in cover that signed in took the Sign in under the ring away (the
+    /// section shows Sign out now), so tvOS had nothing to hand the ring back to when the cover
+    /// closed and it fell to the top of the page. It goes to the section's Sign out, the button
+    /// that took the place of the one that opened the cover (account-identity-card / stremio-card
+    /// swap the same pair). A cover closed without a sign-in finds its Sign in again by itself.
+    private func afterCover(_ closed: Sheet?) {
+        guard let closed else { return }
+        switch closed {
+        case .stremio:
+            if let p = profiles.active, profiles.stremioSession(for: p.id) != nil { returnRing(to: "stremio-out") }
+        default:
+            break
+        }
+    }
+
+    /// An empty full name read "Signed in as" with nothing after it.
+    private static func stremioLine(_ fullname: String?, _ email: String) -> String {
+        let name: String = [fullname ?? "", email].map { $0.trimmingCharacters(in: .whitespaces) }.first { !$0.isEmpty } ?? ""
+        return name.isEmpty ? T("Signed in") : T("Signed in as %@", name)
+    }
+
+    private func testSavedKey() async {
+        guard !tmdbTesting else { return }
+        tmdbTesting = true; defer { tmdbTesting = false }
+        let r = await settings.verifyTmdb(key: settings.slice.tmdbKey)
+        tmdbTestNote = r.ok ? "OK: TMDB accepted the saved key." : "Rejected. TMDB said: \(r.reason ?? "no details")"
+        tmdbTestOk = r.ok
+    }
+
+    private var build: String {
+        let info = Bundle.main.infoDictionary
+        return "\(info?["CFBundleShortVersionString"] as? String ?? "?") (\(info?["CFBundleVersion"] as? String ?? "?"))"
+    }
+
+    private func section<C: View>(_ title: String, @ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: BP.px(12)) {
+            Text(T(title)).font(BP.sans(19, .bold)).foregroundStyle(BP.ink).accessibilityAddTraits(.isHeader)
+            content()
+        }
+        .padding(BP.px(22))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(BPThemeCardFace(radius: BP.rMD))
+        .background(RoundedRectangle(cornerRadius: BP.rMD, style: .continuous).fill(BP.panel))
+        .overlay(RoundedRectangle(cornerRadius: BP.rMD, style: .continuous).stroke(BP.edge, lineWidth: 1))
+        // The whole panel is a focus target, so Down from the Settings cog (far right) lands
+        // on the buttons at the left instead of finding nothing under the cog.
+        .focusSection()
+    }
+
+    private func onOff(_ label: String, _ on: Bool, key: String) -> some View {
+        // A String value, not a literal: an interpolated literal would become the LocalizedStringKey
+        // "%@: %@" and borrow an unrelated catalog entry.
+        let title: String = "\(T(label)): \(T(on ? "On" : "Off"))"
+        return Button(title) { Task { try? await settings.patch([key: .bool(!on)]) } }.buttonStyle(BPActionStyle(primary: on))
+            .bpSelected(on)
+    }
+
+    private func row(_ title: String, detail: String) -> some View {
+        VStack(alignment: .leading, spacing: BP.px(3)) {
+            Text(T(title)).font(BP.sans(16, .semibold)).foregroundStyle(BP.ink)
+            Text(T(detail)).font(BP.sans(14)).foregroundStyle(BP.inkMuted)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+
+/// Numbered toggle chips for preferred subtitle languages (bp-step-subtitles.tsx), shared by
+/// onboarding and Settings. Writes `preferredSubLangs` through the engine on every change.
+struct SubtitleLanguageGrid: View {
+    @EnvironmentObject private var settings: SettingsBridge
+    /// bp-step-subtitles.tsx COMMON: ALL_LANGUAGE_NAMES.slice(0, 24) in upstream's
+    /// order (lib/subtitles/language.ts NAMES), the cells the Settings column's subLang row shows.
+    /// The TV had its own list, so Spanish (Latin America), Portuguese (Brazil), Thai, Vietnamese or
+    /// Hebrew picked there or on the desktop showed here without a cell and could not be removed.
+    private static let common = ["English", "Spanish", "Spanish (Latin America)", "French", "German", "Italian", "Japanese", "Korean", "Chinese", "Russian", "Portuguese", "Portuguese (Brazil)", "Arabic", "Hindi", "Thai", "Vietnamese", "Turkish", "Polish", "Dutch", "Swedish", "Norwegian", "Danish", "Finnish", "Hebrew"]
+
+    /// "A language chosen elsewhere but outside the common set still needs a cell, otherwise this
+    /// screen can select it away but never give it back."
+    private var languages: [String] {
+        var out: [String] = Self.common
+        for lang in settings.slice.preferredSubLangs where !out.contains(lang) { out.append(lang) }
+        return out
+    }
+
+    var body: some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: BP.px(10)), count: 4), spacing: BP.px(10)) {
+            ForEach(languages, id: \.self) { lang in
+                let idx = settings.slice.preferredSubLangs.firstIndex(of: lang)
+                Button(idx.map { "\($0 + 1) · \(lang)" } ?? lang) {
+                    var list = settings.slice.preferredSubLangs
+                    // Upstream's toggle allows an empty list (the Subtitles summary reads "Off", the
+                    // onboarding recap "No subtitle languages set"); forcing English back meant the
+                    // last language could never be removed.
+                    if let i = idx { list.remove(at: i) } else { list.append(lang) }
+                    Task { try? await settings.patch(["preferredSubLangs": .array(list.map { .string($0) })]) }
+                }
+                .buttonStyle(BPActionStyle(primary: idx != nil))
+                .bpSelected(idx != nil)
+            }
+        }
+        .focusSection()
+    }
+}

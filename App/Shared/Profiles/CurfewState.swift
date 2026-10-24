@@ -1,0 +1,73 @@
+import SwiftUI
+
+/// components/curfew-guard.tsx: a kid profile's daily allowance (`kid.curfewMinutes`) counts down
+/// only while something plays; once spent, a lockdown that only the parent PIN (or a profile
+/// switch) can lift. The record lives per profile and per calendar day.
+@MainActor
+final class CurfewState: ObservableObject {
+    static let shared = CurfewState()
+    struct Record: Codable { var date: String; var seconds: Int; var unlocked: Bool }
+    @Published private(set) var locked = false
+    @Published private(set) var profile: ProfilesStore.Profile?
+    private var ticker: Task<Void, Never>?
+
+    /// lib/curfew.ts todayKey: the viewer's local calendar day. Was `.iso8601`, whose
+    /// format style is pinned to GMT, so the allowance rolled over at UTC midnight (8 pm in New
+    /// York): a spent allowance came back that evening and a parent's unlock ran out mid-evening.
+    /// Same yyyy-MM-dd spelling, so a record written today still matches when the dates agree.
+    private static func today() -> String {
+        let c = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+    private static func key(_ id: String) -> String { "harbor.curfew.v1.\(id)" }
+
+    /// The record is a Swift-only Prefs key (a Codable struct, not an engine string),
+    /// so engine/profilesRoom.ts PROFILE_KEY_PREFIXES can't reach it: ProfilesStore drops it when a
+    /// profile is deleted here or dropped by a roster sync.
+    static func purge(profileId id: String) {
+        Prefs.remove(key(id))
+    }
+
+    private func load(_ id: String) -> Record {
+        let r = Prefs.get(Record.self, for: Self.key(id))
+        if let r, r.date == Self.today() { return r }
+        return Record(date: Self.today(), seconds: 0, unlocked: false)
+    }
+
+    func start() {
+        guard ticker == nil else { return }
+        ticker = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                self?.tick()
+            }
+        }
+    }
+
+    private func tick() {
+        let p = ProfilesStore.shared.active
+        // Publish only on a change: RootView observes this object, and assigning the same
+        // values every second re-rendered the root (and every observer) once a second for everyone.
+        guard let p, let limit = p.kid?.curfewMinutes, limit > 0 else {
+            if profile != nil { profile = nil }
+            if locked { locked = false }
+            return
+        }
+        if profile != p { profile = p }
+        var rec = load(p.id)
+        if PlaybackState.shared.active, !rec.unlocked, rec.seconds < limit * 60 {
+            rec.seconds += 1
+            try? Prefs.set(rec, for: Self.key(p.id))
+        }
+        let now = !rec.unlocked && rec.seconds >= limit * 60
+        if locked != now { locked = now }
+    }
+
+    /// The parent PIN was entered: the rest of today is free.
+    func unlock() {
+        guard let p = profile else { return }
+        var rec = load(p.id); rec.unlocked = true
+        try? Prefs.set(rec, for: Self.key(p.id))
+        locked = false
+    }
+}

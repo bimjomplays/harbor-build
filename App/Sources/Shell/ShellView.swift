@@ -1,0 +1,593 @@
+import SwiftUI
+import UIKit
+
+/// The Big Picture shell: ambient background, top bar, the current room, hint bar.
+/// Rooms ask the shell to re-evaluate default focus (e.g. when their rows arrive).
+final class ShellFocus {
+    static let shared = ShellFocus()
+    var request: (() -> Void)?
+    func requestDefault() { request?() }
+    /// When the ring last left a top-bar tab (walking the bar, or on to the profile chip
+    /// or the cog). A room's first-focus seed that lands later leaves the ring there (RoomView).
+    var barMovedAt: Date?
+    /// A top-bar tab holds the ring right now (BPRailView goes back to rest only then, not when a
+    /// page or panel opened over the room took focus away).
+    var barHasFocus = false
+}
+
+private struct ShellFocusNamespaceKey: EnvironmentKey { static let defaultValue: Namespace.ID? = nil }
+extension EnvironmentValues {
+    var shellFocusNamespace: Namespace.ID? {
+        get { self[ShellFocusNamespaceKey.self] }
+        set { self[ShellFocusNamespaceKey.self] = newValue }
+    }
+}
+
+/// use-bp-focus toNav → focusBpTopBar(root, tab): a room's row asks its shell's top bar to take the
+/// ring, on the tab the row names (nil: the active tab). Each press is a new serial, so asking for
+/// the same tab twice still moves the ring.
+struct BPBarRequest: Equatable {
+    var serial: Int
+    var tab: Room?
+}
+
+private struct BPFocusTopBarKey: EnvironmentKey { static let defaultValue: ((Room?) -> Void)? = nil }
+extension EnvironmentValues {
+    /// Set by ShellView on its room; nil anywhere else, where a row has no bar to go to.
+    var bpFocusTopBar: ((Room?) -> Void)? {
+        get { self[BPFocusTopBarKey.self] }
+        set { self[BPFocusTopBarKey.self] = newValue }
+    }
+}
+
+struct ShellView: View {
+    @EnvironmentObject private var app: AppModel
+    @Namespace private var focusNS
+    @Environment(\.resetFocus) private var resetFocus
+
+    @EnvironmentObject private var settings: SettingsBridge
+    /// Per-profile tab locks and hidden anime (Profiles/ParentalGate.swift).
+    @ObservedObject private var parental = ParentalGate.shared
+    /// Deep links waiting to be shown (AppModel.showWaitingLink).
+    @ObservedObject private var links = DeepLinkQueue.shared
+    /// A row's Left off its start (BPRowView onNavEdge): the bar puts the ring on a tab.
+    @State private var barRequest = BPBarRequest(serial: 0, tab: nil)
+    /// The ring is on the top bar (a tab, the profile chip, the account menu or the cog).
+    @State private var barHeld = false
+    /// This shell's claim on GamepadMonitor's LB/RB hook (setOnTab / clearOnTab).
+    @State private var hookOwner = UUID()
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            room
+                .environment(\.bpFocusTopBar, { tab in requestBar(tab) })
+            // Up from an in-place layer (Collections' overlay) reached the bar behind it.
+            TopBarView(request: barRequest, barHeld: $barHeld).disabled(app.roomLayer)
+            VStack { Spacer(); HintBarView(actions: hints) }
+        }
+        // bp-shell.tsx fallback → popBigPicture: a tab is [home, tab], so Back from a tab lands on
+        // Home; at Home the press is declined and belongs to the system (the app closes), which
+        // is why Home's hint says Exit. Rooms with their own Back handling sit deeper and win.
+        .onExitCommand(perform: backToHome)
+        // bp-settings "Edge margin": a whole-screen inset for sets that crop the picture.
+        .padding(.horizontal, 1920 * CGFloat(settings.slice.overscanFraction))
+        .padding(.vertical, 1080 * CGFloat(settings.slice.overscanFraction))
+        .ignoresSafeArea()
+        .focusScope(focusNS)
+        .environment(\.shellFocusNamespace, focusNS)
+        .onAppear {
+            let request: () -> Void = { resetFocus(in: focusNS) }
+            let onTab: (Int) -> Void = { delta in cycleTab(delta) }
+            // Under the PiP browse layer the main shell's hooks wait in PiPBrowse's stash.
+            if inBrowseLayer || !PiPBrowse.shared.stashMainHooks(request: request, onTab: onTab, appearing: true, owner: hookOwner) {
+                ShellFocus.shared.request = request
+                GamepadMonitor.shared.setOnTab(onTab, owner: hookOwner)
+            }
+            ParentalGate.shared.attach()
+            leaveHiddenRoom()
+        }
+        // App.tsx: a room the profile may not see (anime hidden, a locked tab) falls back to
+        // Home, whichever way it was reached: the bar, a shoulder button, a settings row, a
+        // profile switch or a lock that just took effect.
+        .onChange(of: app.room) { _, _ in leaveHiddenRoom() }
+        .onChange(of: parental.gate) { _, _ in leaveHiddenRoom() }
+        // Hiding the tab the viewer is on (tab editing, or a profile-sync pull) or
+        // declining Sports leaves it for Home. Only these changes do: a hidden tab reached
+        // afterwards from Settings, Search or a deep link still opens (see Room.shellTabs).
+        .onChange(of: settings.navLayout) { _, _ in leaveHiddenTab() }
+        .onChange(of: settings.sportsDeclined) { _, _ in leaveHiddenTab() }
+        // The PiP browse layer's shell leaves the hooks alone: PiPBrowse hands them back to the main shell.
+        .onDisappear {
+            if !inBrowseLayer, !PiPBrowse.shared.stashMainHooks(request: nil, onTab: nil, appearing: false, owner: hookOwner) { GamepadMonitor.shared.clearOnTab(owner: hookOwner) }
+        }
+        // lib/deep-link.ts links (AppModel.handle) wait in DeepLinkQueue until nothing is presented
+        // over this shell, then open here: a present from a view already presenting is dropped.
+        .task(id: links.waiting) { await showWaitingLinks() }
+        // Each deep-link page reports that it came on screen: one that never does is put
+        // back in the queue (AppModel.requeueDroppedLink) instead of blocking every later link.
+        .fullScreenCover(item: $app.deepLinkMeta) { m in
+            DetailView(meta: m).onAppear { app.deepLinkCoverAppeared() }
+        }
+        // addons.tsx installModal for a stremio://…/manifest.json link (AppModel.handle): nothing
+        // installs until the viewer confirms. Kid profiles get KidsShellView, never this dialog.
+        .fullScreenCover(item: $app.deepLinkInstall) { link in
+            DeepLinkInstallCover(url: link.url, onClose: { app.deepLinkInstall = nil })
+                .onAppear { app.deepLinkCoverAppeared() }
+        }
+        // Calendar: lib/reminders-runner.tsx and its toast (Calendar/CalendarPanels.swift).
+        .overlay(alignment: .top) { ReminderToastHost() }
+        .overlay(alignment: .top) {
+            if let n = app.deepLinkNote {
+                Text(n).font(BP.sans(14, .semibold)).foregroundStyle(BP.ink).padding(.horizontal, BP.px(16)).padding(.vertical, BP.px(8))
+                    .background(Capsule().fill(BP.panel)).padding(.top, BP.barHeight + BP.px(8))
+                    .task { try? await Task.sleep(for: .seconds(4)); app.deepLinkNote = nil }
+            }
+        }
+    }
+
+    @ViewBuilder private var room: some View {
+        switch app.room {
+        case .settings: SettingsView()
+        case .home, .movies, .shows, .anime:
+            // Home draws the profile's HomeLayout; the other rooms read their own pages.
+            // An edit of that layout opens Home afresh (AppModel.homeGeneration).
+            RoomView(room: app.room, source: app.room == .home ? app.homeLayoutSource : app.browseSource)
+                .id(app.room == .home ? "home.\(app.homeGeneration)" : app.room.rawValue)
+        case .search:
+            // bp-search over lib/search-context: the query and results live in the app's store, so
+            // they survive a trip to another tab (AppModel.views).
+            SearchView(views: app.views)
+        case .discover:
+            DiscoverView()
+        case .library:
+            // bp-view-state libraryTab: the tab picked last is where Library opens again.
+            LibraryView(views: app.views)
+        case .calendar:
+            CalendarView()
+        case .live:
+            // bp-view-state liveCategory: the chip picked last is where Live TV opens again.
+            LiveView(views: app.views)
+        case .collections:
+            CollectionsView()
+        case .sports:
+            SportsView()
+        default: RoomPlaceholderView(room: app.room)
+        }
+    }
+
+    /// A room's row ran off its start (BPRowView onNavEdge): the bar takes the ring.
+    private func requestBar(_ tab: Room?) {
+        // focusBpTopBar: "a dialog owns navigation while it is up; jumping behind it would strand
+        // it". A page over the room (a service page's rows reach here through the environment) or
+        // an in-place layer keeps the ring.
+        let clear: Bool = inBrowseLayer ? PiPBrowse.shared.noCoverPresented : (!PlaybackState.shared.active && Self.noCoverPresented)
+        guard clear, !app.roomLayer else { return }
+        barRequest = BPBarRequest(serial: barRequest.serial + 1, tab: tab)
+    }
+
+    private func leaveHiddenRoom() {
+        if parental.hides(app.room) { app.room = .home }
+    }
+
+    /// The current room is a top-bar tab that just left the strip: back to Home.
+    private func leaveHiddenTab() {
+        leaveHiddenRoom()
+        guard app.room != .home, Room.tabs.contains(app.room), !Room.offTVBar.contains(app.room) else { return }
+        let order = Room.tvBar(sportsDeclined: settings.sportsDeclined, gate: parental, nav: settings.navLayout)
+        if !order.contains(app.room) { app.room = .home }
+    }
+
+    private var backToHome: (() -> Void)? {
+        // In the PiP browse layer, Back at Home returns to the player screen instead of leaving the app.
+        if app.room == .home {
+            if inBrowseLayer { return { PiPBrowse.shared.backToPlayer() } }
+            // As in Apple's TV app, Menu deep in Home's rows first
+            // brings the ring back up to the bar (the rows return to rest under it); only Menu on
+            // the bar leaves the app. It quit straight from the fifth row down.
+            guard !barHeld else { return nil }
+            return { requestBar(.home) }
+        }
+        return { app.room = .home }
+    }
+
+    /// While a link waits, look twice a second for this shell to be clear
+    /// and show it. Over a page, a Settings or Addons cover, a collection page or the account menu
+    /// it opens once they close; over the player, once the player closes (upstream's openMeta pushes
+    /// over the player and unmounts it; here the film is never stopped for a link). The task
+    /// restarts whenever the queue changes, so a link that arrives later is picked up at once.
+    private func showWaitingLinks() async {
+        while !Task.isCancelled, app.hasWaitingLink(kidShell: false) {
+            if app.showWaitingLink(kidShell: false, clear: linkClear) { return }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+    }
+
+    /// Nothing is presented over this shell, so a deep-link cover can go up. The app's own shell
+    /// never takes one while the PiP browse layer is up over it (the layer's shell does, on its
+    /// own window); the layer's shell only while its window is still up.
+    /// Nor while the intro wall, the curfew lock or the screensaver sits over every Big Picture
+    /// layer (AppModel.shellReachable): the main window's own `presentedViewController` check never
+    /// saw any of the three, since they live above it (the intro wall in the same window at a
+    /// higher zIndex, the lock and saver in HarborOverlayWindow), so a link used to open unseen
+    /// under them.
+    private var linkClear: Bool {
+        guard AppModel.shellReachable else { return false }
+        if inBrowseLayer { return PiPBrowse.shared.layerApp === app && PiPBrowse.shared.noCoverPresented }
+        return !PiPBrowse.shared.isUp && !PlaybackState.shared.active && Self.noCoverPresented
+    }
+
+    /// This shell is the Picture in Picture browse layer's (Player/PiPBrowse.swift), over a player.
+    private var inBrowseLayer: Bool { PiPBrowse.shared.isBrowseApp(app) }
+
+    /// bp-shell.tsx HINTS per route kind. "search" and "phone" are left out: both name the pad's
+    /// Y button (the quick panel / phone typing), which this port does not bind, and the bar
+    /// exists to stop advertising dead keys. "nav" needs a jump key (bp-shell passes jump only
+    /// when one works); on Apple TV Up already reaches the bar, so it is never advertised.
+    private var hints: [BPHintAction] {
+        switch app.room {
+        case .home: return inBrowseLayer ? [.select, .back, .tabs] : [.select, .exit, .tabs]
+        case .search: return [.type, .back, .tabs]
+        default: return app.roomLayer ? [.select, .back] : [.select, .back, .tabs]
+        }
+    }
+
+    /// use-bp-focus.ts PageUp/PageDown → bp-shell onTab → goBigPictureTab(cycleTab(order, active, delta)).
+    /// Only on a bare route: bp-shell passes no onTab while a layer is up, and a full-screen cover
+    /// (detail, pages, panels) or playback is exactly that here.
+    private func cycleTab(_ delta: Int) {
+        // LB/RB reach GameController directly, not the overlay window's press handling, so
+        // under the screensaver they turned the tab behind it. The first press only wakes the saver.
+        if ScreensaverModel.shared.active { ScreensaverModel.shared.wake(); return }
+        // The PiP browse layer's shell turns over the player in PiP: only its own covers count there.
+        let clear = inBrowseLayer ? PiPBrowse.shared.noCoverPresented : (!PlaybackState.shared.active && Self.noCoverPresented)
+        // Nor while a room's in-place layer is up (AppModel.roomLayer).
+        guard app.stage == .shell, clear, !CurfewState.shared.locked, !app.roomLayer else { return }
+        let order = Room.tvBar(sportsDeclined: settings.sportsDeclined, gate: parental, nav: settings.navLayout)
+        guard !order.isEmpty else { return }
+        // A room off the strip (Settings, or a hidden tab opened from Search) steps onto its ends.
+        let next: Room
+        if let from = order.firstIndex(of: app.room) {
+            next = order[((from + delta) % order.count + order.count) % order.count]
+        } else {
+            next = delta > 0 ? order[0] : order[order.count - 1]
+        }
+        ActivityMonitor.shared.touch()
+        BPSound.shared.pageTurn(next: delta > 0)
+        app.room = next
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { ShellFocus.shared.requestDefault() }
+    }
+
+    private static var noCoverPresented: Bool { HarborOverlayWindow.noCoverPresented }
+}
+
+/// bp-hint-bar.tsx BpAction and its three glyph maps. Hardware key names are not translated.
+enum BPHintAction: String {
+    case select, back, exit, search, type, clear, toggle, phone, tabs, nav, actions, advance
+
+    var label: String {
+        switch self {
+        case .select: return "Select"
+        case .toggle: return "Toggle"
+        case .type: return "Type"
+        case .phone: return "Phone keyboard"
+        case .back: return "Back"
+        case .exit: return "Exit"
+        case .search: return "Search"
+        case .clear: return "Clear"
+        case .tabs: return "Switch tab"
+        case .nav: return "Nav"
+        case .actions: return "Hold to skip or continue"
+        case .advance: return "Hold to continue"
+        }
+    }
+
+    var padGlyph: String? {
+        switch self {
+        case .select, .toggle, .type: return "A"
+        case .back, .exit: return "B"
+        case .search, .phone: return "Y"
+        case .tabs: return "LB / RB"
+        case .actions, .advance: return "▼"
+        default: return nil
+        }
+    }
+
+    /// A hint with no remote glyph is dropped on a remote without a pad.
+    var remoteGlyph: String? {
+        switch self {
+        case .select, .toggle, .type: return "OK"
+        case .back, .exit: return "Back"
+        case .nav: return "Menu"
+        case .actions, .advance: return "▼"
+        default: return nil
+        }
+    }
+
+    var keyGlyph: String {
+        switch self {
+        case .select, .toggle, .type: return "Enter"
+        case .back, .exit: return "Esc"
+        case .search, .phone: return "Tab"
+        case .clear: return "Del"
+        case .tabs: return "PgUp / PgDn"
+        case .nav: return "Home"
+        case .actions, .advance: return "↓"
+        }
+    }
+}
+
+
+/// Top bar (bp-top-bar.tsx): brand at the start, icon-only tabs in the middle,
+/// profile chip + Settings cog at the end, clock last. Sits over an upward scrim.
+struct TopBarView: View {
+    @EnvironmentObject private var settings: SettingsBridge
+    @EnvironmentObject private var app: AppModel
+    @EnvironmentObject private var profiles: ProfilesStore
+    @ObservedObject private var parental = ParentalGate.shared
+    @FocusState private var focusedTab: Room?
+    /// focusBar placed the ring itself (a row named a tab): the landing is not redirected.
+    @State private var barRequested = false
+    /// The bar's other buttons (profile chip, account menu): Left from them onto a tab is a walk
+    /// along the bar, not an entry from a room.
+    @FocusState private var chromeFocus: String?
+    @State private var chromeLeftAt: Date = .distantPast
+    /// The tab that last held the ring: focus coming back to it (a tab's long-press menu closing)
+    /// is not an entry from a room either.
+    @State private var lastTab: Room?
+    /// ShellView's latest "ring to the bar" request (a row's Left off its start).
+    var request = BPBarRequest(serial: 0, tab: nil)
+    /// Told whether anything on the bar holds the ring (Menu at Home leaves the app only then).
+    @Binding var barHeld: Bool
+
+    var body: some View {
+        HStack(spacing: BP.px(9)) {
+            HStack(spacing: BP.px(7)) {
+                HarborMark(size: BP.px(28))
+                HarborWordmark(px: 24)
+            }
+            .padding(.trailing, BP.px(12))
+            // The brand is one word to VoiceOver, not the mark's asset name and "Harb", "o", "r".
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(verbatim: "Harbor"))
+            ForEach(Room.tvBar(sportsDeclined: settings.sportsDeclined, gate: parental, nav: settings.navLayout)) { r in
+                Button { app.room = r } label: { Image(systemName: r.icon).font(.system(size: BP.px(17), weight: .semibold)) }
+                    .buttonStyle(BPTabStyle(active: app.room == r || (r == .library && Room.offTVBar.contains(app.room))))
+                    .focused($focusedTab, equals: r)
+                    // context-menu.tsx `kind: "nav"` (long press on the remote): hide the tab, show
+                    // every hidden one, or reset the layout. Reordering lives in Settings → Tabs.
+                    .contextMenu { tabMenu(r) }
+                    .overlay(alignment: .bottom) { tabHint(r) }
+                    // Calendar: nav-items.tsx unseen-reminder badge (Calendar/CalendarPanels.swift).
+                    .overlay(alignment: .topTrailing) { if r == .calendar { CalendarTabBadge() } }
+                    .accessibilityIdentifier("tab-\(r.rawValue)")
+                    .accessibilityLabel(T(r.label))
+                    // bp-top-bar data-bp-tab-on: the room on screen reads as the selected tab.
+                    .bpSelected(app.room == r)
+            }
+            Spacer(minLength: BP.px(8))
+            Rectangle().fill(BP.edge2).frame(width: 1, height: BP.px(26))
+            if let p = profiles.active {
+                Button { app.switchProfile() } label: {
+                    HStack(spacing: BP.px(8)) {
+                        ProfileFace(profile: p, size: BP.px(28))
+                        Text(p.name).font(BP.sans(14, .semibold)).foregroundStyle(BP.ink).lineLimit(1)
+                    }
+                    .padding(.horizontal, BP.px(8))
+                    .frame(height: BP.tabItem)
+                }
+                .buttonStyle(BPTabStyleWide())
+                .focused($chromeFocus, equals: "profile")
+                .accessibilityIdentifier("profile-chip")
+                // bp-profile-menu.tsx: `${t("Switch profile")}: ${name}` (the colon and the name need no translation).
+                .accessibilityLabel(Text(verbatim: "\(T("Switch profile")): \(p.name)"))
+            }
+            // The account menu: Who's watching and Settings.
+            AccountMenuButton().environmentObject(app)
+                .focused($chromeFocus, equals: "account")
+            Button { app.room = .settings } label: { Image(systemName: Room.settings.icon).font(.system(size: BP.px(17), weight: .semibold)) }
+                .buttonStyle(BPTabStyle(active: app.room == .settings))
+                .focused($focusedTab, equals: .settings)
+                .accessibilityIdentifier("tab-settings")
+                .accessibilityLabel(T(Room.settings.label))
+                .bpSelected(app.room == .settings)
+            StatusGlyphs()
+            ClockView().padding(.leading, BP.px(6))
+        }
+        .padding(.horizontal, BP.gutter)
+        .frame(height: BP.barHeight)
+        // One full-width focus target: Up from anything in a room reaches the bar even when
+        // nothing focusable sits directly above it (the brand mark is not a button).
+        .focusSection()
+        // use-bp-focus stops seeding once the viewer has moved: a room's seed now waits
+        // for Continue Watching (up to 3 s), and it pulled the ring off the bar the viewer was walking.
+        .onChange(of: focusedTab) { old, new in
+            // Up from a room landed on whichever tab sat above the card (Home
+            // from the first Movies poster), so Up, Right opened the wrong room. As on Apple's own
+            // tab bar, entering the bar lands on the room on screen unless a row asked for a tab.
+            let fromChrome: Bool = chromeFocus != nil || Date().timeIntervalSince(chromeLeftAt) < 0.5
+            if old == nil, let new, !barRequested, !fromChrome, new != lastTab, new != app.room, new != .settings, onBar(app.room) {
+                focusedTab = app.room
+                ShellFocus.shared.barHasFocus = true
+                return
+            }
+            barRequested = false
+            if let new { lastTab = new }
+            if old != nil { ShellFocus.shared.barMovedAt = Date() }
+            ShellFocus.shared.barHasFocus = new != nil
+        }
+        .onChange(of: chromeFocus) { old, new in if old != nil && new == nil { chromeLeftAt = Date() } }
+        .onChange(of: focusedTab != nil || chromeFocus != nil, initial: true) { _, held in
+            if barHeld != held { barHeld = held }
+        }
+        .onChange(of: request) { _, r in focusBar(r.tab) }
+        .background(
+            LinearGradient(colors: [BP.void_.opacity(0.95), BP.void_.opacity(0.6), .clear], startPoint: .top, endPoint: .bottom)
+                .frame(height: BP.barHeight * 1.9), alignment: .top
+        )
+    }
+
+    /// bp-focus-core focusBpTopBar / bpChromeOrder: the tab the row named when it is on the bar,
+    /// else the active tab (the cog for Settings), else the first tab.
+    private func onBar(_ r: Room) -> Bool {
+        r == .settings || Room.tvBar(sportsDeclined: settings.sportsDeclined, gate: parental, nav: settings.navLayout).contains(r)
+    }
+
+    private func focusBar(_ wanted: Room?) {
+        let order: [Room] = Room.tvBar(sportsDeclined: settings.sportsDeclined, gate: parental, nav: settings.navLayout)
+        let target: Room?
+        if let wanted, onBar(wanted) {
+            target = wanted
+        } else if onBar(app.room) {
+            target = app.room
+        } else {
+            target = order.first
+        }
+        guard let target else { return }
+        barRequested = focusedTab == nil
+        focusedTab = target
+        // A move the focus engine drops (the bar disabled under a cover) fires no change to clear it.
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(400))
+            barRequested = false
+        }
+    }
+
+    /// context-menu.tsx nav items: "Hide this tab", "Show all tabs", "Reset layout".
+    @ViewBuilder private func tabMenu(_ r: Room) -> some View {
+        if r.navEditable {
+            Button { Task { await settings.toggleTabHidden(r) } } label: { Label(T("Hide this tab"), systemImage: "eye.slash") }
+        }
+        Button { Task { await settings.showAllTabs() } } label: { Label(T("Show all tabs"), systemImage: "eye") }
+        Button { Task { await settings.resetTabs() } } label: { Label(T("Reset layout"), systemImage: "arrow.counterclockwise") }
+    }
+
+    @ViewBuilder private func tabHint(_ r: Room) -> some View {
+        if focusedTab == r {
+            Text(T(r.label))
+                .font(BP.sans(12, .semibold)).foregroundStyle(BP.ink)
+                .padding(.horizontal, BP.px(10)).padding(.vertical, BP.px(4))
+                .background(RoundedRectangle(cornerRadius: BP.rSM, style: .continuous).fill(BP.panel2))
+                .overlay(RoundedRectangle(cornerRadius: BP.rSM, style: .continuous).stroke(BP.edge2, lineWidth: 1))
+                .shadow(color: .black.opacity(0.45), radius: 14, y: 10)
+                .fixedSize()
+                .offset(y: BP.px(38))
+                .transition(.opacity)
+        }
+    }
+}
+
+struct BPTabStyleWide: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        BPFocusReader { focused in
+            configuration.label
+                .background(RoundedRectangle(cornerRadius: BP.rXS, style: .continuous).fill(focused ? BP.glass : .clear))
+                .overlay { if focused { RoundedRectangle(cornerRadius: BP.rXS, style: .continuous).stroke(BP.focusStroke, lineWidth: 3) } }
+                .scaleEffect(focused ? 1.04 : 1)
+                .animation(BP.easeFast, value: focused)
+        }
+    }
+}
+
+/// bp-status.tsx: WifiOff when the network path is down. No battery on a television.
+struct StatusGlyphs: View {
+    @ObservedObject private var net = NetworkStatus.shared
+    var body: some View {
+        HStack(spacing: BP.px(10)) {
+            Image(systemName: net.online ? "wifi" : "wifi.slash").foregroundStyle(net.online ? BP.inkMuted : BP.danger)
+                // bp-status.tsx: a connected glyph is nothing to announce; the offline one still reads.
+                .accessibilityHidden(net.online)
+        }
+        .font(.system(size: BP.px(15), weight: .semibold))
+        .padding(.leading, BP.px(8))
+    }
+}
+
+/// bp-top-bar.tsx useClock (hour + minute). Redrawn on each minute boundary: a
+/// 30 s timer counted from when the view appeared showed the old minute for up to 30 s (upstream's
+/// 20 s interval, up to 20 s), and each rebuild (theme, language, a return to the shell) restarted it.
+struct ClockView: View {
+    /// The screensaver's clock sits over full-bleed art: larger and in full ink there.
+    var prominent = false
+    var body: some View {
+        TimelineView(.everyMinute) { context in
+            Text(context.date, format: .dateTime.hour().minute())
+                .font(BP.sans(prominent ? 22 : 15, prominent ? .semibold : .medium)).foregroundStyle(prominent ? BP.ink : BP.inkMuted)
+        }
+    }
+}
+
+/// Hint bar (bp-hint-bar.tsx): right-aligned glyph chips with labels. The glyphs follow the
+/// input: pad glyphs while a game controller is connected (falling back to the key a keyboard
+/// would use), remote glyphs otherwise, and a hint the remote has no button for is dropped.
+struct HintBarView: View {
+    let actions: [BPHintAction]
+    @ObservedObject private var pads = GamepadMonitor.shared
+
+    private struct Hint: Identifiable { var id: String; var glyph: String; var label: String }
+
+    private var hints: [Hint] {
+        let shown = actions.filter { $0 != .nav }
+        let usable = pads.usingPad ? shown : shown.filter { $0.remoteGlyph != nil }
+        return usable.map { a in
+            let glyph = (pads.usingPad ? a.padGlyph : a.remoteGlyph) ?? a.keyGlyph
+            return Hint(id: a.rawValue, glyph: glyph, label: T(a.label))
+        }
+    }
+
+    var body: some View {
+        // With the Siri Remote the bar only repeated what its two
+        // buttons already say, and it sat over the bottom row of every page; Apple TV apps show
+        // none. It comes back while a game controller is in use, where the glyphs do teach something.
+        if pads.usingPad { bar }
+    }
+
+    private var bar: some View {
+        HStack(spacing: BP.px(18)) {
+            Spacer()
+            ForEach(hints) { h in
+                HStack(spacing: BP.px(7)) {
+                    // Wide chips (more than one character) are rounded rects; single glyphs are circles.
+                    Text(h.glyph)
+                        .font(BP.sans(h.glyph.count > 1 ? 12.5 : 13.4, .semibold)).foregroundStyle(BP.ink)
+                        .padding(.horizontal, h.glyph.count > 1 ? BP.px(7) : 0)
+                        .frame(minWidth: BP.px(22), minHeight: BP.px(22), maxHeight: BP.px(22))
+                        .background(RoundedRectangle(cornerRadius: h.glyph.count > 1 ? BP.rXS : BP.px(11), style: .continuous).fill(BP.edge2))
+                    Text(h.label).font(BP.sans(13.4, .medium)).foregroundStyle(BP.inkMuted)
+                }
+                // One hint reads as "OK, Select", not two stray elements.
+                .accessibilityElement(children: .combine)
+            }
+        }
+        .padding(.horizontal, BP.gutter)
+        .frame(height: BP.hintHeight)
+        .background(LinearGradient(colors: [.clear, BP.void_.opacity(0.9)], startPoint: .top, endPoint: .bottom))
+    }
+}
+
+/// Rooms that arrive in a later stage.
+struct RoomPlaceholderView: View {
+    let room: Room
+    var body: some View {
+        VStack(alignment: .leading, spacing: BP.px(12)) {
+            Text(T(room.label)).font(BP.display(36)).foregroundStyle(BP.ink)
+            Text("Coming in Stage \(room.arrivesIn).").font(BP.sans(16)).foregroundStyle(BP.inkMuted)
+        }
+        .padding(.horizontal, BP.gutter).padding(.top, BP.barHeight + BP.px(20))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .accessibilityElement(children: .combine)
+        .focusable()
+    }
+}
+
+/// addons.tsx `installModal` opened by a deep link: the install dialog on its own AddonsModel (its
+/// install refreshes the catalog and says harbor:addons-changed like the Addons screen's).
+private struct DeepLinkInstallCover: View {
+    let url: String
+    let onClose: () -> Void
+    @StateObject private var model = AddonsModel()
+
+    var body: some View {
+        AddonConfigureView(target: AddonsModel.ConfigureTarget(mode: .url, name: T("Add from URL"), prefill: url),
+                           model: model, onClose: onClose)
+    }
+}

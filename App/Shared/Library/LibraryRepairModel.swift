@@ -1,0 +1,130 @@
+import SwiftUI
+
+/// Library repair (settings/advanced-panel/library-repair-rows.tsx): "Repair library" rewrites
+/// every Stremio library item to Stremio's exact schema with live progress
+/// (`harbor:library-repair`), and "Fix corrupted anime" scans for anime saved under a movie or
+/// series id, then removes just those. Both act on the active profile's Stremio library.
+@MainActor
+final class LibraryRepairModel: ObservableObject {
+    struct Step: Decodable { var phase: String; var fetched: Int?; var total: Int?; var needsRepair: Int?; var pushed: Int? }
+    struct Outcome: Decodable { var total: Int; var alreadyClean: Int; var repaired: Int; var unrepairable: Int }
+    struct Found: Decodable, Identifiable { var id: String; var name: String }
+
+    @Published private(set) var busy = false
+    @Published private(set) var step: Step?
+    @Published private(set) var outcome: Outcome?
+    @Published private(set) var failure: String?
+    /// idle | scanning | scanned | removing | done | error
+    @Published private(set) var animePhase = "idle"
+    @Published private(set) var found: [Found] = []
+    @Published private(set) var removed = 0
+    @Published private(set) var animeFailure: String?
+    private var unsubscribe: (() -> Void)?
+
+    deinit { unsubscribe?() }
+
+    var authKey: String? {
+        guard let p = ProfilesStore.shared.active else { return nil }
+        return ProfilesStore.shared.stremioSession(for: p.id)?.authKey
+    }
+
+    private static func message(_ error: Error) -> String {
+        let text = "\(error)"
+        return text.split(separator: "\n").first.map(String.init)?.replacingOccurrences(of: "Error: ", with: "") ?? text
+    }
+
+    func run() async {
+        guard let key = authKey, !busy else { return }
+        if unsubscribe == nil {
+            unsubscribe = HarborEngine.shared.onEvent { [weak self] type, detail in
+                guard type == "harbor:library-repair", let s = detail.flatMap({ try? $0.decode(Step.self) }) else { return }
+                self?.step = s
+            }
+        }
+        busy = true
+        failure = nil
+        outcome = nil
+        step = Step(phase: "fetching", fetched: nil, total: nil, needsRepair: nil, pushed: nil)
+        defer { busy = false }
+        do {
+            let r: Outcome = try await HarborEngine.shared.call("libraryRoom.repair", [key])
+            outcome = r
+        } catch {
+            failure = Self.message(error)
+        }
+    }
+
+    /// LibraryRepairRow statusLine.
+    var line: String {
+        if let f = failure { return T("Failed: %@", f) }
+        if let r = outcome {
+            if r.total == 0 { return T("Library is empty. Nothing to repair.") }
+            return T("%lld fixed, %lld already clean", r.repaired, r.alreadyClean) + (r.unrepairable > 0 ? T(", %lld unrepairable", r.unrepairable) : "") + "."
+        }
+        guard let s = step else {
+            return "Rewrites every library item to match Stremio's exact schema. Run once if your Stremio app started crashing after Harbor synced playback."
+        }
+        switch s.phase {
+        case "fetching": return s.total.map { T("Fetching %lld items…", $0) } ?? T("Fetching library index…")
+        case "normalizing": return s.needsRepair.map { T("%lld items need repair.", $0) } ?? T("Checking %lld items…", s.total ?? 0)
+        case "pushing": return T("Pushing %lld of %lld…", s.pushed ?? 0, s.needsRepair ?? 0)
+        default: return T("Done.")
+        }
+    }
+
+    var cta: String { busy ? "Working…" : (outcome != nil ? "Run again" : "Repair now") }
+
+    /// AnimeRepairRow: scan first; when the scan found entries the same button removes them.
+    func animeAction() async {
+        guard let key = authKey, !animeBusy else { return }
+        if animePhase == "scanned" && !found.isEmpty {
+            animePhase = "removing"
+            do {
+                let n: Int = try await HarborEngine.shared.call("libraryRoom.animeHeal", [key])
+                removed = n
+                animePhase = "done"
+            } catch {
+                animeFailure = Self.message(error)
+                animePhase = "error"
+            }
+        } else {
+            animePhase = "scanning"
+            animeFailure = nil
+            do {
+                let list: [Found] = try await HarborEngine.shared.call("libraryRoom.animeScan", [key])
+                found = list
+                animePhase = "scanned"
+            } catch {
+                animeFailure = Self.message(error)
+                animePhase = "error"
+            }
+        }
+    }
+
+    var animeBusy: Bool { animePhase == "scanning" || animePhase == "removing" }
+    var showRemove: Bool { animePhase == "scanned" && !found.isEmpty }
+
+    var animeLine: String {
+        if let f = animeFailure { return T("Failed: %@", f) }
+        switch animePhase {
+        case "scanning": return "Scanning your library…"
+        case "scanned":
+            if found.isEmpty { return "No issues found. Your anime library looks clean." }
+            let names = found.prefix(4).map(\.name).joined(separator: ", ") + (found.count > 4 ? "…" : "")
+            return T("Found %lld: %@. These are saved under the wrong id, which breaks Continue Watching and Trakt marking.", found.count, names)
+        case "removing": return "Removing…"
+        case "done": return T("Removed %lld. Rewatch and they re-add correctly.", removed)
+        default: return "Finds anime saved under a movie or series id (which breaks Continue Watching and Trakt) and removes just those so they re-add correctly."
+        }
+    }
+
+    var animeCta: String {
+        switch animePhase {
+        case "scanning": return "Scanning…"
+        case "removing": return "Removing…"
+        case "scanned" where !found.isEmpty: return T("Remove %lld", found.count)
+        case "done", "error", "scanned": return "Scan again"
+        default: return "Scan for corruption"
+        }
+    }
+}

@@ -1,0 +1,379 @@
+// Anime room (use-bp-anime.ts + bp-anime-groups.ts without React): the 16 Jikan spec rows load
+// progressively on Jikan's own queue, Continue Watching comes from local + cloud anime items,
+// the hero is upstream's seeded selection, awards join from the bundled index, addon anime
+// catalogs stream in, and buildBpAnimeGroups shapes it all. Every arrival raises
+// `harbor:anime-updated`; the host re-reads `page()` (cheap, from memory).
+import type { Meta } from "@/lib/cinemeta";
+import { EMPTY_ROW, ROW_MAX_PAGES, ROW_MIN_VISIBLE, SPECS, TOP_PICKS_KEY, type RowState } from "@/views/anime/anime-rows";
+import { buildBpAnimeGroups, filterSpecRows, mergeAwardWinners, dedupeAnimeAddonRows, cleanMeta, type BpAnimeRow } from "@/views/big-picture/bp-anime-groups";
+import { buildHeroSelection } from "@/views/anime/hero-build";
+import { animeFiltered, type AnimeFilterOpts } from "@/lib/anime-filter";
+import { applyAnimeRowCustomization, EMPTY_ANIME_ROWS } from "@/lib/anime-customization";
+import { noteAnimeGroups } from "./actions";
+import { loadAnimeAddonRows } from "@/lib/addons-anime-filter";
+import type { AddonRow } from "@/lib/addons";
+import { listLocalCw, localCwEntry } from "@/lib/local-cw";
+import { anyProfileSharesStremioWith, type Profile } from "@/lib/profiles";
+import { fetchSimklPlaybackItems } from "@/lib/simkl/playback";
+import { isAuthenticated as simklConnected } from "@/lib/simkl/session";
+import { isCwDismissed } from "@/lib/cw-dismiss";
+import { franchiseRootSync } from "@/lib/providers/anime-franchise-root";
+import { ANIME_CLOUD_ID, isAnimeCwItem, isCwMember, library, type LibraryItem } from "@/lib/stremio";
+import { readCollections } from "@/lib/collections";
+import { collectionPageIds } from "@/lib/page-collection-rows";
+import { loadEffective } from "@/lib/settings/profile-store";
+import { anilist as anilistGlue, mal as malGlue } from "./trackers";
+import { advanceCw } from "./cwAdvance";
+import { cwAdvanceSettings, cwWatchedSources, detectCwAnime } from "./rooms";
+import { animeTopPicks } from "./animeTopPicks";
+import { withBackdrops } from "./animeArt";
+import { manualWatchedLibraryItems } from "@/lib/manual-watched";
+import { simklWatchedForId, statusForId, type WatchlistStatus } from "@/lib/simkl/list-status";
+import { isAuthenticated as anilistConnectedNow } from "@/lib/anilist/session";
+
+const MAX_ITEMS = 80;
+const CW_CAP = 20;
+const AUTO_FILL_BUDGET = 4;
+
+// lib/i18n t(): English until the host installs the chosen catalog (settingsRoom.installUiCatalog).
+import { t } from "@/lib/i18n";
+
+// ------------------------------------------------------------------------- spec rows
+const rowsByKey: Record<string, RowState> = {};
+for (const s of SPECS) rowsByKey[s.key] = EMPTY_ROW;
+const loading = new Set<string>();
+let started = false;
+let pending = 0;
+const filled = new Set<string>();
+
+function notify(): void {
+  window.dispatchEvent(new CustomEvent("harbor:anime-updated"));
+}
+
+/** use-bp-anime-specs: fire flat in SPECS order; Jikan's 400 ms queue paces the requests. */
+function ensureStarted(): void {
+  if (started) return;
+  started = true;
+  pending = SPECS.length;
+  for (const s of SPECS) {
+    s.fetcher(1)
+      .then((metas) => { rowsByKey[s.key] = { metas, page: 1, hasMore: metas.length >= ROW_MIN_VISIBLE, ready: true }; })
+      .catch(() => { rowsByKey[s.key] = { ...EMPTY_ROW, ready: true }; })
+      .finally(() => { pending -= 1; notify(); });
+  }
+}
+
+export function loadMore(key: string): boolean {
+  if (loading.has(key)) return false;
+  const spec = SPECS.find((s) => s.key === key);
+  const row = rowsByKey[key];
+  if (!spec || !row || !row.hasMore || row.page >= ROW_MAX_PAGES || row.metas.length >= MAX_ITEMS) return false;
+  loading.add(key);
+  const next = row.page + 1;
+  spec.fetcher(next).then((more) => {
+    const cur = rowsByKey[key];
+    const ids = new Set(cur.metas.map((m) => m.id));
+    const fresh = more.filter((m) => !ids.has(m.id));
+    rowsByKey[key] = { ...cur, metas: [...cur.metas, ...fresh], page: next, hasMore: more.length >= ROW_MIN_VISIBLE && cur.metas.length + fresh.length < MAX_ITEMS };
+  }).catch(() => {}).finally(() => { loading.delete(key); notify(); });
+  return true;
+}
+
+/** Re-fetch every spec row (the room's refresh). */
+export function refresh(): void {
+  started = false;
+  filled.clear();
+  for (const s of SPECS) rowsByKey[s.key] = EMPTY_ROW;
+  ensureStarted();
+}
+
+// ------------------------------------------------------------------------ addon rows
+let addonRows: AddonRow[] = [];
+let addonKey: string | null = null;
+let stopAddons: (() => void) | null = null;
+
+function ensureAddons(authKey: string | null, profileId: string): void {
+  // Installed addons are per profile even without a Stremio session (two guest profiles).
+  const key = `${profileId}|${authKey ?? ""}`;
+  if (addonKey === key) return;
+  stopAddons?.();
+  addonKey = key;
+  addonRows = [];
+  stopAddons = loadAnimeAddonRows(authKey, (rows) => { addonRows = rows; notify(); });
+}
+
+// --------------------------------------------------------------- continue watching
+let cloud: { authKey: string; at: number; items: LibraryItem[] } | null = null;
+
+async function cloudItems(authKey: string | null, force: boolean): Promise<LibraryItem[]> {
+  if (!authKey) return [];
+  if (!force && cloud && cloud.authKey === authKey && Date.now() - cloud.at < 30_000) return cloud.items;
+  const items = await library(authKey).catch(() => cloud?.items ?? []);
+  cloud = { authKey, at: Date.now(), items };
+  return items;
+}
+
+function localAnimeCw(): LibraryItem[] {
+  return listLocalCw().filter((e) => ANIME_CLOUD_ID.test(e.id)).map((e) => ({
+    _id: e.id, type: e.type, name: e.name, poster: e.poster, background: e.background,
+    state: { timeOffset: e.positionMs, duration: e.durationMs, season: e.season, episode: e.episode, video_id: e.videoId,
+      flaggedWatched: e.durationMs > 0 && e.positionMs / e.durationMs >= 0.9 ? 1 : 0, lastWatched: new Date(e.t).toISOString() },
+    removed: false, temp: false, _ctime: new Date(e.t).toISOString(), _mtime: new Date(e.t).toISOString(), local: true,
+  } as LibraryItem));
+}
+
+function profilesBlob(): { activeId?: string | null; profiles?: Profile[] } {
+  try { return JSON.parse(localStorage.getItem("harbor.profiles.v1") ?? "{}") as { activeId?: string | null; profiles?: Profile[] }; } catch { return {}; }
+}
+
+/**
+ * use-bp-anime-cw raw: local anime resume + cloud anime items + Simkl playback, dismissed
+ * dropped, cloud rows hidden when this profile shares the Stremio session and asked for
+ * per-profile Continue Watching, one per franchise, newest first.
+ */
+function animeCw(cloudList: LibraryItem[], simklList: LibraryItem[], hideSharedCw: boolean): LibraryItem[] {
+  const pool = [...localAnimeCw(), ...cloudList.filter((i) => !ANIME_CLOUD_ID.test(i._id)), ...simklList];
+  const seen = new Set<string>();
+  const seenRoot = new Set<string>();
+  return pool
+    .filter((i) => {
+      if (!isCwMember(i)) return false;
+      if (!(i as LibraryItem & { local?: boolean }).local && !isAnimeCwItem(i)) return false;
+      if (isCwDismissed(i)) return false;
+      if (hideSharedCw && localCwEntry(i._id) === null && !(i as LibraryItem & { local?: boolean }).local) return false;
+      if (seen.has(i._id)) return false;
+      seen.add(i._id);
+      return true;
+    })
+    .sort((a, b) => Date.parse(b.state?.lastWatched ?? b._mtime) - Date.parse(a.state?.lastWatched ?? a._mtime))
+    .filter((i) => {
+      const root = franchiseRootSync(i._id);
+      if (!root) return true;
+      if (seenRoot.has(root)) return false;
+      seenRoot.add(root);
+      return true;
+    })
+    .slice(0, CW_CAP);
+}
+
+/** use-bp-anime-cw.ts:206-215 resurfaceLibrary: the cloud library with anime manual marks overriding. */
+function resurfaceLibrary(libItems: LibraryItem[]): LibraryItem[] {
+  const manual = manualWatchedLibraryItems().filter(isAnimeCwItem);
+  if (manual.length === 0) return libItems;
+  const memberIds = new Set(libItems.filter(isCwMember).map((i) => i._id));
+  const usable = manual.filter((i) => !memberIds.has(i._id));
+  if (usable.length === 0) return libItems;
+  const overrideIds = new Set(usable.map((i) => i._id));
+  return [...libItems.filter((i) => !overrideIds.has(i._id)), ...usable];
+}
+
+/** The card extras Swift reads from `_cw` (rooms.cwExtras shape): Up Next and the air countdown. */
+function withCardExtras(items: LibraryItem[]): Array<LibraryItem & { _cw: Record<string, unknown> }> {
+  return items.map((i) => {
+    const rec = i as unknown as Record<string, unknown>;
+    const waiting = rec.waitingForAir === true;
+    return { ...i, _cw: { watched: false, newEpisode: 0, upNext: rec.upNext === true, waitingForAir: waiting,
+      nextAirDate: waiting && typeof rec.nextAirDate === "string" ? rec.nextAirDate : null, watcher: null, external: null, anime: true } };
+  });
+}
+
+// ------------------------------------------------------------------- watched filter
+const ANIME_WATCH_ID = /^(kitsu|mal|anilist):/;
+/** use-bp-anime.ts lateRef: hero and picks ids seen so far. Keyed by profile (one
+ *  profile's hero ids never feed another's AniList / Simkl lookups) and LRU-bounded: at the cap
+ *  the oldest id is evicted instead of the set freezing, so later passes' ids still join. A Map
+ *  keeps insertion order; re-seeing an id moves it to the newest end. */
+const lateAnimeIdsByProfile = new Map<string, Map<string, true>>();
+const LATE_IDS_CAP = 400;
+
+function lateAnimeIds(profileId: string): string[] {
+  return [...(lateAnimeIdsByProfile.get(profileId)?.keys() ?? [])];
+}
+
+function noteLateAnimeIds(profileId: string, metas: Meta[], cap = LATE_IDS_CAP): boolean {
+  let ids = lateAnimeIdsByProfile.get(profileId);
+  if (!ids) { ids = new Map(); lateAnimeIdsByProfile.set(profileId, ids); }
+  let grew = false;
+  for (const m of metas) {
+    if (!m || typeof m.id !== "string" || !ANIME_WATCH_ID.test(m.id)) continue;
+    if (ids.has(m.id)) { ids.delete(m.id); ids.set(m.id, true); continue; }
+    ids.set(m.id, true);
+    grew = true;
+    while (ids.size > cap) {
+      const oldest = ids.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      ids.delete(oldest);
+    }
+  }
+  return grew;
+}
+
+/** Tests: note ids for a profile (optional small cap) and read that profile's set back. */
+export function lateIdsForTest(profileId: string, ids: string[], cap?: number): string[] {
+  noteLateAnimeIds(profileId, ids.map((id) => ({ id } as Meta)), cap);
+  return lateAnimeIds(profileId);
+}
+
+/** use-bp-anime-watched.ts isAnimeWatched: Simkl completed or any Simkl / AniList watched episode. */
+export function animeWatchedFrom(sources: { simklWatched?: Map<string, Set<string>>; simklStatus?: Map<string, WatchlistStatus>; anilistWatched?: Map<string, Set<string>> }): (id: string) => boolean {
+  const simklWatched = sources.simklWatched ?? new Map<string, Set<string>>();
+  const simklStatus = sources.simklStatus ?? new Map<string, WatchlistStatus>();
+  const anilistWatched = sources.anilistWatched ?? new Map<string, Set<string>>();
+  return (id: string) =>
+    statusForId(simklStatus, id) === "completed" ||
+    simklWatchedForId(simklWatched, id).size > 0 ||
+    (anilistWatched.get(id)?.size ?? 0) > 0;
+}
+
+/** The Anime room's CW waits less than Home's: its rows are meant to paint at once. */
+const ANIME_CW_GRACE_MS = 800;
+
+// ------------------------------------------------------------------------------ page
+const seed = Math.floor(Math.random() * 0x7fffffff);
+
+export type RoomRow = { key: string; group: string; name: string; metas: Meta[]; shape: "poster" | "rank"; loading: boolean; notice: string | null; hasMore: boolean; page: number };
+
+export async function page(profileId: string, linked: boolean, authKey: string | null, force = false) {
+  const s = loadEffective(profileId, linked);
+  if (force) refresh(); else ensureStarted();
+  ensureAddons(authKey, profileId);
+  const hideWatched = !!s.animeHideWatchedPicks;
+  const blob = profilesBlob();
+  const active = (blob.profiles ?? []).find((p) => p.id === (blob.activeId ?? profileId)) ?? null;
+  const hideSharedCw = !!s.cwPerProfile && anyProfileSharesStremioWith(active, blob.profiles ?? []);
+  const simkl = simklConnected() ? await fetchSimklPlaybackItems().then((list) => list.filter(isAnimeCwItem)).catch(() => [] as LibraryItem[]) : [];
+  const libItems = await cloudItems(authKey, force);
+  // (TV) Anime under IMDb ids join the anime row once detected (rooms.detectCwAnime); only the
+  // library items Continue Watching could show are checked.
+  await detectCwAnime(libItems.filter((i) => isCwMember(i)));
+  const cwRaw = animeCw(libItems, simkl, hideSharedCw);
+  // use-bp-anime.ts:106-120 useCwAdvance(cwBase.raw, …, "only", no Trakt set, …).
+  const conf = cwAdvanceSettings(s);
+  // use-bp-anime.ts useBpAnimeWatched(watchedIds): the Simkl / AniList maps the CW advance reads
+  // also feed the "Hide anime I've already watched" filter; watchedIds is CW plus the hero and
+  // picks ids of earlier passes (the filter read local flags only).
+  const sources = conf.enabled || hideWatched
+    ? await cwWatchedSources(cwRaw, false, hideWatched ? lateAnimeIds(profileId) : []).catch(() => null)
+    : null;
+  const filterOpts: AnimeFilterOpts = { excludeOrigins: s.animeExcludeOrigins ?? [], hideWatched, isWatched: sources ? animeWatchedFrom(sources) : undefined };
+  const cw = conf.enabled
+    ? await advanceCw(`anime:${profileId}`, cwRaw, { ...conf, ...(sources ?? (await cwWatchedSources(cwRaw, false))), library: resurfaceLibrary(libItems), animeMode: "only" }, notify, ANIME_CW_GRACE_MS)
+      .catch(() => cwRaw)
+    : cwRaw;
+
+  const hero = buildHeroSelection(rowsByKey, seed, filterOpts, []);
+  // useBpAnimeTopPicks (lib/use-anime-top-picks.ts): watch history, sequels, taste genres and
+  // settings.animeFavoriteGenres. Upstream falls back to the hosted hero list when nothing is
+  // left; the TV has no hosted hero and falls back to the top-airing spec row it used before.
+  const picked = animeTopPicks({ libItems, continueWatching: cwRaw, heroMetas: hero.metas, favoriteGenres: Array.isArray(s.animeFavoriteGenres) ? s.animeFavoriteGenres : [] }, filterOpts, notify);
+  const picksRow = rowsByKey[TOP_PICKS_KEY];
+  const topPicks = picked.length > 0
+    ? picked.map(cleanMeta)
+    : (picksRow?.metas ?? []).filter((m) => !animeFiltered(m, filterOpts)).map(cleanMeta).slice(0, 20);
+  const specRows = filterSpecRows(rowsByKey, topPicks);
+  // use-bp-anime.ts lateIds: hero and picks ids join watchedIds for the next pass (AniList only
+  // answers for ids it was asked about), and that pass re-reads when the list grew.
+  if (hideWatched && noteLateAnimeIds(profileId, [...hero.metas, ...picked]) && anilistConnectedNow()) setTimeout(notify, 0);
+
+  // use-bp-anime auto-fill: a row the dedupe left short pulls its next page, up to a budget.
+  if (filled.size < AUTO_FILL_BUDGET) {
+    for (const spec of SPECS) {
+      const raw = rowsByKey[spec.key];
+      if (!raw?.ready || !raw.hasMore || raw.page >= ROW_MAX_PAGES) continue;
+      const shown = specRows[spec.key];
+      if (!shown || shown.metas.length >= ROW_MIN_VISIBLE || filled.has(spec.key)) continue;
+      filled.add(spec.key);
+      loadMore(spec.key);
+      if (filled.size >= AUTO_FILL_BUDGET) break;
+    }
+  }
+
+  const awards = mergeAwardWinners(specRows, []);
+  const collections = readCollections().filter((c) => collectionPageIds("anime").includes(c.id));
+  const malConnected = malGlue.status().authenticated;
+  const anilistConnected = anilistGlue.status().authenticated;
+  const malRails = malConnected ? malGlue.rails(force) : { rails: [], loading: false, error: false };
+  const anilistRails = anilistConnected ? anilistGlue.rails(force) : { rails: [], loading: false, error: false };
+  const groups = buildBpAnimeGroups({
+    t, renamed: s.animeRows?.renamed ?? {},
+    cwItems: cw, cwReady: true, cwPending: false,
+    malConnected, malRails: malRails.rails, malState: { loading: malRails.loading, error: malRails.error },
+    anilistConnected, anilistRails: anilistRails.rails, anilistState: { loading: anilistRails.loading, error: anilistRails.error },
+    anilistTrending: [], anilistTop: [],
+    awards, specRows, addonRows: dedupeAnimeAddonRows(addonRows, s.hideContent?.adult !== false), collections,
+  });
+  // Row customisation (order / hidden / renamed) as the anime settings store it.
+  noteAnimeGroups(groups.map((g) => ({ key: g.key, name: g.name })), profileId);
+  const ordered = applyAnimeRowCustomization(groups.map((g) => ({ key: g.key, name: g.name, group: g })), s.animeRows ?? EMPTY_ANIME_ROWS);
+  const rows: RoomRow[] = [];
+  // bp-anime.tsx:100-108: "Top Picks for You" sits right after Continue Watching.
+  if (topPicks.length > 0) {
+    rows.push({ key: "anime-top-picks", group: "picks", name: t("Top Picks for You"), metas: topPicks, shape: "poster", loading: false, notice: null, hasMore: false, page: 1 });
+  }
+  for (const entry of ordered) {
+    for (const r of entry.group.rows as BpAnimeRow[]) {
+      if (r.id === "continueWatching") continue;
+      // MAL / AniList placeholders need a sign-in the TV cannot do yet; they stay out of the rail.
+      if (r.notice && (r.group === "yourMalLists" || r.group === "yourAnilistLists")) continue;
+      rows.push({ key: r.id, group: r.group, name: entry.name === r.title ? r.title : r.title, metas: r.metas, shape: r.ranked ? "rank" : "poster",
+        loading: !!r.loading, notice: r.notice ?? null, hasMore: !!r.source?.hasMore, page: r.source?.page ?? 1 });
+    }
+  }
+  const ready = SPECS.filter((sp) => rowsByKey[sp.key]?.ready).length;
+  // use-bp-anime.ts:238: failure is "every feed answered with nothing", never "every row hidden".
+  const fetched = SPECS.reduce((n, sp) => n + (rowsByKey[sp.key]?.metas.length ?? 0), 0) + addonRows.reduce((n, r) => n + r.metas.length, 0);
+  return {
+    rows, hero: withBackdrops(hero.metas.slice(0, 8), notify), picks: topPicks, cw: withCardExtras(cw),
+    loading: pending > 0, ready, total: SPECS.length,
+    failed: ready === SPECS.length && fetched === 0 && cw.length === 0,
+  };
+}
+
+/** Next page of one spec row for the "See all" grid (rooms.page equivalent). */
+export async function specPage(key: string, pageNo: number): Promise<Meta[]> {
+  const spec = SPECS.find((sp) => sp.key === key);
+  if (!spec) return [];
+  return (await spec.fetcher(pageNo)).map(cleanMeta);
+}
+
+
+// ------------------------------------------------------------ hero actions / meta line
+// bp-anime-hero-meta.tsx: the award pill or "New", the MAL score, "Sub and Dub", the country.
+import { findTopAward as heroTopAward, parseAwardYear as heroAwardYear } from "@/lib/anime-awards";
+import { CR_CATEGORY_SHORT as heroCategoryShort, shortCategory as heroShortCategory } from "@/lib/anime-award-labels";
+import { animeHasDub as heroHasDub, ensureDubSet as heroEnsureDub } from "@/lib/providers/anime-dub-sub";
+import { jikanScore as heroJikanScore } from "@/lib/mal-rating";
+import { kitsuToMal as heroKitsuToMal } from "@/lib/providers/anime-mapping";
+import { dubSetReady as heroDubReady } from "@/lib/providers/anime-dub-sub";
+export type HeroMeta = { topLine: string; score: string | null; fromMal: boolean; dub: boolean; country: string; episode: string; minutesLeft: string };
+// lib/mal-rating resolveMalId: mal: ids directly, kitsu: ids through the ARM mapping.
+async function heroMalId(metaId: string): Promise<number | null> {
+  if (metaId.startsWith("mal:")) { const n = Number(metaId.slice(4)); return Number.isFinite(n) ? n : null; }
+  if (metaId.startsWith("kitsu:")) { const n = Number(metaId.slice(6)); return Number.isFinite(n) ? heroKitsuToMal(n).catch(() => null) : null; }
+  return null;
+}
+export async function heroMeta(meta: Meta, profileId: string, linked: boolean, cwItem: { season?: number | null; episode?: number | null; duration?: number | null; timeOffset?: number | null } | null): Promise<HeroMeta> {
+  const s = loadEffective(profileId, linked);
+  const win = heroTopAward(meta.name ?? "", heroAwardYear(meta.releaseInfo), meta.id);
+  // bp-anime-hero-meta.tsx bpTopLine / bpAwardPill: t("Anime of the year"), t("Best {label}") over
+  // bpAwardShortLabel (the catalog's short category through t()), else t("New").
+  const known = win ? heroCategoryShort[win.categoryKey] : undefined;
+  const topLine = win
+    ? (win.isAOTY ? t("Anime of the year") : t("Best {label}", { label: known ? t(known) : heroShortCategory(win) }))
+    : meta.releaseInfo === String(new Date().getFullYear()) ? t("New") : "";
+  const malId = await heroMalId(meta.id);
+  const jikan = malId ? await heroJikanScore(malId).catch(() => null) : null;
+  const score = jikan ?? meta.imdbRating ?? null;
+  let dub = false;
+  if (s.showDubBadge !== false) {
+    // ensureDubSet fires the load and returns; wait (bounded) for the set before asking it.
+    try { heroEnsureDub(); for (let i = 0; i < 30 && !heroDubReady(); i += 1) await new Promise((r) => setTimeout(r, 100)); dub = heroHasDub(meta.id); } catch { dub = false; }
+  }
+  const c = (meta as { country?: string }).country ?? "";
+  const country = c.length > 3 && c !== "Japan" ? c : "";
+  const se = cwItem?.season ?? 0, ep = cwItem?.episode ?? 0;
+  const episode = ep > 0 ? (se > 0 ? t("S{s} E{e}", { s: se, e: ep }) : t("E{e}", { e: ep })) : "";
+  const dur = cwItem?.duration ?? 0, off = cwItem?.timeOffset ?? 0;
+  const left = dur > 0 ? Math.round((dur - off) / 60000) : 0;
+  return { topLine, score, fromMal: jikan != null, dub, country, episode, minutesLeft: left >= 1 ? t("{n} min left", { n: left }) : "" };
+}

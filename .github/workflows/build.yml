@@ -1,0 +1,241 @@
+# Builds Harbor (Apple TV + iPhone) on GitHub-hosted runners. Lives in the public build copy as
+# .github/workflows/build.yml (scripts/publish-public.sh puts it there).
+#  - engine:     TypeScript engine bundle + its offline tests, Rust library tests (Linux)
+#  - apps:       Rust xcframework, both apps built for the simulator, iPhone unit tests (macOS)
+#  - testflight: both apps archived, signed in the cloud and uploaded to TestFlight (main pushes and manual runs)
+# Secrets: UPSTREAM_SSH_KEY (read-only deploy key of the private upstream repo), HARBOR_BUNDLE_ID,
+# APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (App Store Connect API key).
+# The repo is public: logs stay in the job output (where secrets are masked), never uploaded as files.
+name: build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      testflight:
+        description: Upload to TestFlight
+        type: boolean
+        default: true
+permissions:
+  contents: read
+env:
+  # Cargo's downloads live in the workspace so the cache paths below need no home folder.
+  CARGO_HOME: ${{ github.workspace }}/.cargo-home
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/harbor-upstream
+          ssh-key: ${{ secrets.UPSTREAM_SSH_KEY }}
+          path: reference/harbor
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: engine/package-lock.json
+      - name: Engine
+        working-directory: engine
+        run: |
+          npm ci --no-audit --no-fund
+          node build.mjs --min
+          node test/shims.test.mjs
+      - name: Engine smoke (live services, informational)
+        working-directory: engine
+        continue-on-error: true
+        run: timeout 900 node smoke.mjs | tail -40
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-home/registry
+            .cargo-home/git
+            rust/harbor-ffi/target
+          key: cargo-linux-${{ hashFiles('rust/harbor-ffi/Cargo.lock') }}
+      - name: Rust tests
+        working-directory: rust/harbor-ffi
+        run: cargo test --release
+
+  apps:
+    runs-on: macos-26
+    timeout-minutes: 75
+    env:
+      HARBOR_BUNDLE_ID: ${{ secrets.HARBOR_BUNDLE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/harbor-upstream
+          ssh-key: ${{ secrets.UPSTREAM_SSH_KEY }}
+          path: reference/harbor
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: engine/package-lock.json
+      - name: Tools
+        run: |
+          brew install xcodegen
+          xcodebuild -version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-home/registry
+            .cargo-home/git
+            rust/harbor-ffi/target
+          key: cargo-apple-${{ hashFiles('rust/harbor-ffi/Cargo.lock') }}
+      - name: Rust xcframework
+        run: rust/build.sh > rust.log 2>&1 || { grep -E "^error" -A8 rust.log | head -80; tail -30 rust.log; exit 1; }
+      - name: Engine + upstream assets
+        run: scripts/prepare.sh
+      - name: Generate project
+        run: scripts/generate.sh
+      - uses: actions/cache@v4
+        with:
+          path: spm
+          key: spm-${{ hashFiles('project.yml') }}
+      - name: Build Apple TV (simulator)
+        run: |
+          set -o pipefail
+          xcodebuild -project Harbor.xcodeproj -scheme Harbor -configuration Debug \
+            -destination 'generic/platform=tvOS Simulator' -derivedDataPath build -clonedSourcePackagesDirPath spm \
+            CODE_SIGNING_ALLOWED=NO build > tv.log 2>&1 \
+            || { grep -E "error:" tv.log | sort -u | head -80; tail -40 tv.log; exit 1; }
+          grep -c "warning:" tv.log | xargs echo "warnings:"
+      - name: Build iPhone (simulator)
+        run: |
+          set -o pipefail
+          xcodebuild -project Harbor.xcodeproj -scheme HarborPhone -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath build -clonedSourcePackagesDirPath spm \
+            CODE_SIGNING_ALLOWED=NO build-for-testing > phone.log 2>&1 \
+            || { grep -E "error:" phone.log | sort -u | head -80; tail -40 phone.log; exit 1; }
+          grep -c "warning:" phone.log | xargs echo "warnings:"
+      - name: iPhone unit tests
+        run: |
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devs = [d | {"rt": rt} for rt, ds in json.load(sys.stdin)["devices"].items() if "iOS" in rt for d in ds if d["name"].startswith("iPhone")]
+          devs.sort(key=lambda d: (d["rt"], d["name"] == "iPhone 17"))
+          print(devs[-1]["udid"] if devs else "")')
+          test -n "$udid" || { xcrun simctl list devices available; exit 1; }
+          set -o pipefail
+          xcodebuild -project Harbor.xcodeproj -scheme HarborPhone -destination "id=$udid" \
+            -derivedDataPath build -clonedSourcePackagesDirPath spm -only-testing:HarborPhoneTests \
+            CODE_SIGNING_ALLOWED=NO test-without-building > test.log 2>&1 \
+            || { grep -E "error:|failed|XCTAssert" test.log | head -80; tail -40 test.log; exit 1; }
+          grep -E "Executed [0-9]+ tests" test.log | tail -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-xcframework
+          path: rust/out/HarborFFI.xcframework
+
+  testflight:
+    needs: [engine, apps]
+    if: github.event_name == 'push' || inputs.testflight
+    runs-on: macos-26
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scheme: Harbor
+            platform: tvOS
+          - scheme: HarborPhone
+            platform: iOS
+    env:
+      HARBOR_BUNDLE_ID: ${{ secrets.HARBOR_BUNDLE_ID }}
+      HARBOR_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+    steps:
+      - name: Secrets present?
+        id: keys
+        run: |
+          missing=""
+          for v in HARBOR_BUNDLE_ID HARBOR_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do [ -n "${!v}" ] || missing="$missing $v"; done
+          if [ -n "$missing" ]; then
+            echo "::notice title=TestFlight skipped::missing secrets:$missing"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.keys.outputs.ready == 'true'
+      - uses: actions/checkout@v4
+        if: steps.keys.outputs.ready == 'true'
+        with:
+          repository: ${{ github.repository_owner }}/harbor-upstream
+          ssh-key: ${{ secrets.UPSTREAM_SSH_KEY }}
+          path: reference/harbor
+      - uses: actions/setup-node@v4
+        if: steps.keys.outputs.ready == 'true'
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: engine/package-lock.json
+      - uses: actions/download-artifact@v4
+        if: steps.keys.outputs.ready == 'true'
+        with:
+          name: rust-xcframework
+          path: rust/out/HarborFFI.xcframework
+      - name: Prepare
+        if: steps.keys.outputs.ready == 'true'
+        run: |
+          brew install xcodegen
+          xcodebuild -version
+          scripts/prepare.sh
+          scripts/generate.sh
+          mkdir -p "$RUNNER_TEMP/asc"
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8"
+          chmod 600 "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8"
+          # yyyy.mmdd.hhmm (UTC): always higher than any earlier build of either app
+          echo "BUILD_NUMBER=$(date -u +%Y.%m%d.%H%M)" >> "$GITHUB_ENV"
+      - uses: actions/cache/restore@v4
+        if: steps.keys.outputs.ready == 'true'
+        with:
+          path: spm
+          key: spm-${{ hashFiles('project.yml') }}
+      - name: Archive
+        if: steps.keys.outputs.ready == 'true'
+        run: |
+          set -o pipefail
+          xcodebuild -project Harbor.xcodeproj -scheme "${{ matrix.scheme }}" -configuration Release \
+            -destination "generic/platform=${{ matrix.platform }}" -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -clonedSourcePackagesDirPath spm \
+            -allowProvisioningUpdates -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$HARBOR_TEAM_ID" CODE_SIGN_STYLE=Automatic CODE_SIGN_IDENTITY="Apple Development" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" archive > archive.log 2>&1 \
+            || { grep -E "error:" archive.log | sort -u | head -60; tail -40 archive.log; exit 1; }
+      - name: Upload to TestFlight
+        if: steps.keys.outputs.ready == 'true'
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>teamID</key><string>$HARBOR_TEAM_ID</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>testFlightInternalTestingOnly</key><true/>
+          </dict></plist>
+          EOF
+          set -o pipefail
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" > export.log 2>&1 \
+            || { grep -E "error:" export.log | head -60; tail -40 export.log; exit 1; }
+          echo "::notice title=TestFlight::${{ matrix.platform }} build $BUILD_NUMBER uploaded; it shows in TestFlight after Apple's processing."
+      - name: Remove key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc"

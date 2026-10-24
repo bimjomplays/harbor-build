@@ -1,0 +1,229 @@
+// Card marks for browse tiles (bp-card-marks.tsx + bp-card-state-marks.tsx), computed in one
+// pass per row so a Swift tile never asks the engine per card. Score chips are deliberately
+// absent: upstream's TV tile surface carries none ("a ten-foot card carries no score plate",
+// use-bp-card-badges.ts badgeGates), and the hero shows the score of the focused title.
+import { CR_CATEGORY_SHORT, shortCategory } from "@/lib/anime-award-labels";
+import { t } from "@/lib/i18n";
+import { findTopAward, parseAwardYear, type AwardWin } from "@/lib/anime-awards";
+import { ensureAwardMaster } from "@/lib/anime-awards-source";
+import { mergeBundledAwards } from "@/lib/awards-history";
+import { awardSummary, type AwardType } from "@/lib/providers/wikidata";
+import { animeHasDub, dubSetReady, ensureDubSet } from "@/lib/providers/anime-dub-sub";
+import { isTop10, setTop10Metas } from "@/lib/top10-set";
+import { isWatchedFlagged } from "@/lib/watched-flag";
+import { isMovieWatchedLocal } from "@/lib/movie-watched";
+import { evictWatchlistAggregate, watchlistAllIds, watchlistHas } from "@/lib/watchlist";
+import { refreshWatchlistAggregates } from "@/lib/watchlist-sync";
+import { ANIME_CLOUD_ID, cloudWriteId, removeStremioBookmark } from "@/lib/stremio";
+import { isAuthenticated as traktConnected } from "@/lib/trakt/session";
+import { isAuthenticated as simklConnected } from "@/lib/simkl/session";
+import { loadEffective } from "@/lib/settings/profile-store";
+import type { Settings } from "@/lib/settings/types";
+import { BP_ANIME_ID } from "@/views/big-picture/use-bp-card-badges";
+import { tmdbImdbCached, tmdbImdbId } from "@/lib/providers/tmdb/tmdb-imdb-resolve";
+
+export type CardMeta = {
+  id: string;
+  type: string;
+  name: string;
+  releaseInfo?: string | null;
+  releaseDate?: string | null;
+  inTheaters?: boolean | null;
+};
+
+export type Zone = "topStart" | "topEnd" | "bottomEnd" | "bottomStart";
+
+export type CardMarks = {
+  id: string;
+  /** Top-start identity chip: "2023 Winner", "3 Oscars", "DUB", "New", "Rerun · 2015", "In Cinema". */
+  chip: string | null;
+  bookmark: Zone | null;
+  watched: "topEnd" | "bottomEnd" | null;
+  top10: "left" | "right" | null;
+};
+
+// bp-award-mark.tsx NOUN table.
+const NOUN: Record<string, string> = {
+  oscar: "Oscar", emmy: "Emmy", golden_globe: "Globe", bafta: "BAFTA", sag: "SAG", critics_choice: "Critics",
+  cannes: "Cannes", venice: "Venice", berlin: "Berlin", annie: "Annie", spirit: "Spirit", saturn: "Saturn",
+  bafta_tv: "BAFTA", cesar: "Cesar", goya: "Goya", blue_dragon: "Blue Dragon", baeksang: "Baeksang", bifa: "BIFA", other: "Award",
+};
+
+// bp-award-mark.tsx bpClassicAwardLabel: body names stay English; the count form is translated.
+function classicLabel(type: AwardType, wins: number): string {
+  const noun = NOUN[type] ?? NOUN.other;
+  if (wins <= 1) return noun;
+  return noun.endsWith("s") ? t("{n} {award}", { n: wins, award: noun }) : t("{n} {award}s", { n: wins, award: noun });
+}
+
+function animeAwardLabel(win: AwardWin): string {
+  const known = CR_CATEGORY_SHORT[win.categoryKey];
+  // bp-card-marks.tsx bpAwardShortLabel: the short category goes through t().
+  return `${win.year} ${known ? t(known) : shortCategory(win)}`;
+}
+
+function isInCinema(m: CardMeta): boolean {
+  return m.type === "movie" && m.inTheaters === true;
+}
+
+function isRerun(m: CardMeta): boolean {
+  if (m.type !== "movie" || !m.releaseDate) return false;
+  const released = Date.parse(m.releaseDate);
+  if (Number.isNaN(released)) return false;
+  return (Date.now() - released) / (1000 * 60 * 60 * 24 * 30.44) > 9;
+}
+
+function chipFor(m: CardMeta, s: Settings): string | null {
+  if (!s.showCardBadges) return null;
+  const isAnime = BP_ANIME_ID.test(m.id);
+  const year = parseAwardYear(m.releaseInfo);
+  if (isAnime) {
+    const win = findTopAward(m.name ?? "", year, m.id);
+    if (win) return animeAwardLabel(win);
+  } else {
+    const won = awardSummary(mergeBundledAwards(null, m.name, year)).find((x) => x.wins > 0);
+    if (won) return classicLabel(won.type, won.wins);
+  }
+  if (s.showDubBadge && isAnime && dubSetReady() && animeHasDub(m.id)) return t("DUB");
+  const cinema = isInCinema(m);
+  if (!cinema && !!m.releaseInfo && m.releaseInfo === String(new Date().getFullYear())) return t("New");
+  if (cinema) return isRerun(m) ? `${t("Rerun")}${m.releaseInfo ? ` · ${m.releaseInfo}` : ""}` : t("In Cinema");
+  return null;
+}
+
+let primed = false;
+function prime(anime: boolean): void {
+  if (primed) return;
+  primed = true;
+  // Both are network feeds; a first row renders without them and the next call sees them.
+  void ensureAwardMaster().catch(() => {});
+  if (anime) ensureDubSet();
+}
+
+/**
+ * Marks for one screenful of cards, using the profile's effective settings. A watchlist entry
+ * or watched flag is often stored under the imdb id while a TMDB-built row carries a tmdb one
+ * (useTmdbImdbId in the tiles); the resolver's cache makes the alt lookup free after the first.
+ */
+export function marks(metas: CardMeta[], profileId: string, linked: boolean): CardMarks[] {
+  const s = loadEffective(profileId, linked);
+  prime(metas.some((m) => BP_ANIME_ID.test(m.id)));
+  // useTmdbImdbId: the cache answers now; a miss resolves in the background for the next pass.
+  const alts = metas.map((m) => {
+    if (!m.id.startsWith("tmdb:")) return null;
+    const hit = tmdbImdbCached(m.id);
+    if (hit === undefined && s.tmdbKey) void tmdbImdbId(s.tmdbKey, m.id).catch(() => null);
+    return hit ?? null;
+  });
+  const has = (i: number, test: (id: string) => boolean) => test(metas[i].id) || (!!alts[i] && test(alts[i] as string));
+  // bpCardZones: scores take topEnd when badgePlacement is "top", else bottomEnd; the watched
+  // check always takes the other end. The TV tile has no scores, but the corner stays theirs.
+  const scoresZone = s.badgePlacement === "top" ? "topEnd" : "bottomEnd";
+  const watchedZone = scoresZone === "bottomEnd" ? "topEnd" : "bottomEnd";
+  const bookmarkZone = s.watchlistBadge === "off" ? null : (s.watchlistBadge as Zone);
+  const ribbonSide = s.top10RibbonSide === "left" ? "left" : "right";
+  return metas.map((m, i) => ({
+    id: m.id,
+    chip: chipFor(m, s),
+    bookmark: bookmarkZone && has(i, watchlistHas) ? bookmarkZone : null,
+    watched: s.showWatchedBadge && (has(i, isWatchedFlagged) || (m.type === "movie" && has(i, isMovieWatchedLocal))) ? watchedZone : null,
+    // On a television the ribbon is the mark, not a preference (bp-card-state-marks.tsx).
+    top10: isTop10(m.id, m.name) ? ribbonSide : null,
+  }));
+}
+
+/** The room's Top 10 (bp-top10-feed.ts): one set at a time, the shell's rows are the floor. */
+export function setTop10(metas: Array<{ id: string; name: string }>): void {
+  setTop10Metas(metas);
+}
+
+/**
+ * watchlist-sync.tsx refreshWatchlistAggregates: the Stremio library (minus removed/temp) plus the
+ * Trakt and Simkl watchlists (imdb and tmdb:movie|tv forms) feed the aggregate the bookmark mark
+ * reads. A signed-out or disconnected source contributes nothing. Returns the aggregate's size.
+ */
+export async function refreshWatchlist(authKey: string | null): Promise<number> {
+  await refreshWatchlistAggregates(authKey, traktConnected(), simklConnected());
+  return watchlistAllIds().length;
+}
+
+/**
+ * watchlist.ts syncWithStremio's removal (ec6a696d "twin ghosts"): the same film can sit in the
+ * cloud as tt… and as tmdb:…, so every form the add path could have written goes, and the
+ * aggregate drops them at once (evictWatchlistAggregate) instead of waiting for a refresh.
+ * `imdbId` is the resolved tt id when the detail page knows it. Returns the ids removed.
+ */
+export async function removeFromWatchlist(authKey: string, id: string, imdbId: string | null): Promise<string[]> {
+  const imdb = typeof imdbId === "string" && /^tt\d+$/.test(imdbId) ? imdbId : null;
+  const forms = new Set<string>();
+  const withImdb = cloudWriteId(id, imdb, !!imdb);
+  const withMeta = cloudWriteId(id, imdb, false);
+  if (withImdb) forms.add(withImdb);
+  if (withMeta) forms.add(withMeta);
+  if (ANIME_CLOUD_ID.test(id)) forms.add(id);
+  for (const rid of forms) await removeStremioBookmark(authKey, rid);
+  evictWatchlistAggregate(forms);
+  return Array.from(forms);
+}
+
+// ------------------------------------------------------------------ hero awards corner
+// components/meta-awards-corner.tsx as bp-spotlight mounts it (MetaAwardsCorner, the "full" tier:
+// the TV hero is wider than 820 CSS px). Anime ids (kitsu:/mal:) read the bundled anime award
+// wins ("{source} Winner", the top win's "Anime of the Year" / category line, "+N more awards");
+// everything else merges live Wikidata awards (IMDb ids only, 8 s cap) with the bundled history,
+// ranks with awardSummary + pickHeroAwards and prints "{Headline} Winner|Nominee" over the first
+// two "{n} Oscars" / "{n} Oscar nominations" lines. The laurel only wraps a win.
+import { findAnyAwardWins, awardSourceMeta } from "@/lib/anime-awards";
+import { fetchAwards, pickHeroAwards } from "@/lib/providers/wikidata";
+
+export type HeroAwardsCorner = { kind: "anime" | "classic"; headline: string; lines: string[]; won: boolean; mark: string; tint: string };
+
+const CORNER_HEADLINE: Record<string, string> = {
+  oscar: "Academy Award", emmy: "Primetime Emmy", bafta: "BAFTA", golden_globe: "Golden Globe", sag: "SAG Award",
+  cannes: "Cannes", venice: "Venice", berlin: "Berlin", critics_choice: "Critics' Choice",
+};
+const CORNER_NOUN: Record<string, string> = {
+  oscar: "Oscar", emmy: "Emmy", bafta: "BAFTA", golden_globe: "Golden Globe", sag: "SAG Award", cannes: "Cannes Award",
+  venice: "Venice Award", berlin: "Berlin Award", critics_choice: "Critics' Choice Award",
+};
+// components/icons/award-logo.tsx laurelColorFor.
+const LAUREL: Record<string, string> = {
+  oscar: "#D4AF37", emmy: "#D4AF37", golden_globe: "#D4AF37", bafta: "#CA9200", bafta_tv: "#CA9200", annie: "#E0A93E",
+  spirit: "#3E8ED0", saturn: "#9AA5B1", cesar: "#C9A227", goya: "#8C6A3F", blue_dragon: "#3E7BD0", baeksang: "#C9A227",
+  bifa: "#B8B8B8", critics_choice: "#CE8819", sag: "#B08D57", cannes: "#DAA520", venice: "#DAA520", berlin: "#BFBFBF",
+};
+function cornerNoun(type: string, n: number): string {
+  const base = CORNER_NOUN[type] ?? "Award";
+  if (n === 1 || base.endsWith("s")) return base;
+  return `${base}s`;
+}
+
+export async function heroAwards(meta: CardMeta, imdbId?: string | null): Promise<HeroAwardsCorner | null> {
+  const year = parseAwardYear(meta.releaseInfo);
+  if (meta.id.startsWith("kitsu:") || meta.id.startsWith("mal:")) {
+    const wins = findAnyAwardWins(meta.name ?? "", year);
+    if (wins.length === 0) return null;
+    const top = wins[0];
+    const src = awardSourceMeta(top.source);
+    const subline = top.isAOTY ? `${top.year} Anime of the Year` : `${top.year} ${top.categoryName.replace(/^Best\s+/i, "Best ")}`;
+    const others = wins.length - 1;
+    const lines = [subline];
+    if (others > 0) lines.push(`+${others} more award${others === 1 ? "" : "s"}`);
+    return { kind: "anime", headline: `${src.name} Winner`, lines, won: true, mark: src.shortName, tint: "" };
+  }
+  const id = imdbId ?? (meta.id.startsWith("tt") ? meta.id.split(":")[0] : null);
+  const live = id
+    ? await Promise.race([fetchAwards(id, meta.type === "series").catch(() => null), new Promise<null>((r) => setTimeout(() => r(null), 8000))])
+    : null;
+  const summary = pickHeroAwards(awardSummary(mergeBundledAwards(live, meta.name, year)));
+  if (summary.length === 0) return null;
+  const top = summary[0];
+  const won = top.wins > 0;
+  const lines: string[] = [];
+  for (const item of summary) {
+    if (item.wins > 0) lines.push(`${item.wins} ${cornerNoun(item.type, item.wins)}`);
+    else if (item.nominations > 0) lines.push(`${item.nominations} ${cornerNoun(item.type, item.nominations)} ${item.nominations === 1 ? "nomination" : "nominations"}`);
+  }
+  return { kind: "classic", headline: `${CORNER_HEADLINE[top.type] ?? "Award"} ${won ? "Winner" : "Nominee"}`, lines: lines.slice(0, 2), won,
+    mark: CORNER_NOUN[top.type] ?? NOUN[top.type] ?? "Award", tint: LAUREL[top.type] ?? "#D4AF37" };
+}

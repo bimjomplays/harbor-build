@@ -1,0 +1,81 @@
+import SwiftUI
+
+/// bp-keyboard.tsx: four rows of keys (letters or symbols), then Space / Backspace / Clear / set toggle.
+struct BPKeyboardView: View {
+    let onChar: (String) -> Void
+    let onBackspace: () -> Void
+    let onClear: () -> Void
+    /// Bumped by the page to put the ring back on the keyboard (bp-search moves it to
+    /// the field when a recent query is picked or the list cleared); it lands on the first key.
+    var focusRequest = 0
+    /// The keyboard gained (true) or lost (false) the ring.
+    var onHold: ((Bool) -> Void)? = nil
+    @State private var symbols = false
+    @FocusState private var focusedKey: String?
+
+    /// Letters first, digits last: Search opened with the ring on
+    /// "1", one row away from every letter a title starts with.
+    private static let letters = ["qwertyuiop", "asdfghjkl'", "zxcvbnm,.-", "1234567890"].map { $0.map(String.init) }
+    private static let symbolRows = ["!@#$%^&*()", "+=/\\|~`°£€", ":;\"?<>[]{}", "éèáàöüñçåø"].map { $0.map(String.init) }
+    private let keySize = BP.px(44)
+    /// Focus ids for the bottom row, so `onHold` covers the whole keyboard: with
+    /// the ring on Space, Backspace, Clear or the set toggle the keyboard reported losing it, and
+    /// SearchView's bp-restore spot kept the last result, so a return to Search put the ring back
+    /// on that result instead of the keyboard. Never a character the letter rows use.
+    private static let spaceKey = "__space"
+    private static let backspaceKey = "__backspace"
+    private static let clearKey = "__clear"
+    private static let toggleKey = "__toggle"
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: BP.px(8)) {
+            ForEach(Array((symbols ? Self.symbolRows : Self.letters).enumerated()), id: \.offset) { _, row in
+                HStack(spacing: BP.px(8)) {
+                    ForEach(row, id: \.self) { ch in
+                        Button { onChar(ch) } label: { Text(ch).font(BP.sans(17, .semibold)).frame(width: keySize, height: keySize) }
+                            .buttonStyle(BPKeyStyle())
+                            .focused($focusedKey, equals: ch)
+                            .accessibilityIdentifier("key-\(ch)")
+                    }
+                }
+            }
+            HStack(spacing: BP.px(8)) {
+                Button { onChar(" ") } label: { Label("Space", systemImage: "space").font(BP.sans(13, .semibold)).lineLimit(1).frame(width: keySize * 4 + BP.px(24), height: keySize) }
+                    .buttonStyle(BPKeyStyle()).accessibilityIdentifier("key-space")
+                    .focused($focusedKey, equals: Self.spaceKey)
+                Button(action: onBackspace) { Label("Backspace", systemImage: "delete.left").font(BP.sans(13, .semibold)).lineLimit(1).frame(width: keySize * 2.6, height: keySize) }
+                    .buttonStyle(BPKeyStyle()).accessibilityIdentifier("key-backspace")
+                    .focused($focusedKey, equals: Self.backspaceKey)
+                Button(action: onClear) { Label("Clear", systemImage: "xmark").font(BP.sans(13, .semibold)).lineLimit(1).frame(width: keySize * 1.8, height: keySize) }
+                    .buttonStyle(BPKeyStyle()).accessibilityIdentifier("key-clear")
+                    .focused($focusedKey, equals: Self.clearKey)
+                    // bp-keyboard.tsx aria={t("Clear search")}.
+                    .accessibilityLabel(Text(T("Clear search")))
+                Button { symbols.toggle() } label: { Text(symbols ? "abc" : "?#+").font(BP.sans(13, .semibold)).frame(width: keySize * 1.4, height: keySize) }
+                    .buttonStyle(BPKeyStyle()).accessibilityIdentifier("key-toggle")
+                    .focused($focusedKey, equals: Self.toggleKey)
+                    // bp-keyboard.tsx aria={symbols ? t("Letters") : t("Symbols")}: "abc" / "?#+" say nothing.
+                    .accessibilityLabel(Text(T(symbols ? "Letters" : "Symbols")))
+            }
+        }
+        .focusSection()
+        .onChange(of: focusedKey != nil) { _, held in onHold?(held) }
+        .onChange(of: focusRequest) { _, _ in
+            let first = (symbols ? Self.symbolRows : Self.letters).first?.first
+            DispatchQueue.main.async { focusedKey = first }
+        }
+    }
+}
+
+struct BPKeyStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        BPFocusReader { focused in
+            configuration.label
+                .foregroundStyle(BP.ink)
+                .background(RoundedRectangle(cornerRadius: BP.rXS, style: .continuous).fill(focused ? BP.on : BP.panel2))
+                .overlay(RoundedRectangle(cornerRadius: BP.rXS, style: .continuous).stroke(focused ? BP.focusStroke : BP.edge2, lineWidth: focused ? 3 : 1))
+                .scaleEffect(focused ? (configuration.isPressed ? 1.0 : 1.05) : 1)
+                .animation(BP.easeFast, value: focused)
+        }
+    }
+}

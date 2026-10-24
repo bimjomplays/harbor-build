@@ -1,0 +1,144 @@
+import Foundation
+
+/// Which engine a PlayerScreen runs (upstream's `engine: "html5" | "mpv"`, use-player-bridge.ts:62).
+/// `.native` is AVPlayer, the TV's stand-in for upstream's html5 engine.
+enum PlayerEngineKind: String, Decodable {
+    case mpv
+    case native
+}
+
+/// What PlayerScreen and its dialogs drive, whichever engine is underneath (upstream's
+/// lib/player/bridge.ts PlayerBridge, cut down to what the TV chrome uses). Track ids are only
+/// unique per type, as with mpv. Both conformers are view controllers, so it lives on the main actor.
+@MainActor
+protocol PlayerEngineControlling: AnyObject {
+    var engineKind: PlayerEngineKind { get }
+    func togglePause()
+    func setPaused(_ paused: Bool)
+    func seek(_ seconds: Double)
+    func seek(to seconds: Double)
+    /// Position and duration in seconds, and whether playback is paused.
+    func snapshot() -> (position: Double, duration: Double, paused: Bool)
+    func tracks() -> [MPVPlayerController.Track]
+    func select(track: MPVPlayerController.Track?, type: String)
+    func setSecondarySub(_ track: MPVPlayerController.Track?)
+    func setAudioDelay(_ seconds: Double)
+    func setMuted(_ muted: Bool)
+    func isMuted() -> Bool
+    /// bridge.ts setRate: the playback speed (speed-menu.tsx, settings.defaultPlaybackSpeed).
+    func setRate(_ rate: Double)
+    func bufferedSec() -> Double
+    func streamFilename() -> String?
+    func refreshSubtitleStyle()
+    func setSubDelay(_ seconds: Double)
+    /// The subtitle delay in force (a show's remembered delay is applied when the file opens).
+    func currentSubDelay() -> Double
+    /// lib/player-prefs.ts / subtitle-memory.ts key for this playback; nil remembers nothing.
+    var trackMemory: TrackMemory? { get }
+    func setShaders(_ paths: [String])
+    func videoWidth() -> Int
+    /// bridge.ts snap.chapters (mpv chapter-list), for skip-intro/chapters.ts; the html5 bridge has none.
+    func chapters() -> [PlayerChapter]
+    func addSubtitle(file: URL, title: String, lang: String)
+    /// mpv.ts addSeedSubtitles → mpv_sub_add(select: false): one of the stream's own subtitles,
+    /// listed but not shown (mpv `sub-add … auto`). Not a pick: `subPicks` stays as it is.
+    func addSeedSubtitle(file: URL, title: String, lang: String)
+    /// Bumped by every subtitle selection (the viewer's or the plan's), never by a seed's add.
+    var subPicks: Int { get }
+    /// bridge.ts capabilities().pictureInPicture: the overlay shows its PiP control only when true.
+    var supportsPictureInPicture: Bool { get }
+    var isPictureInPictureActive: Bool { get }
+    /// bridge.ts requestPiP / exitPiP.
+    func startPictureInPicture()
+    func stopPictureInPicture()
+    /// use-exit-snapshot grabFrame (snapshots.ts captureFrame on html5, captureMpvFrame on
+    /// mpv): the picture on screen now as a small JPEG (Player/ExitSnapshot.swift FrameGrab), nil
+    /// when there is none. The frame is taken at once; the scale and encode run off the main
+    /// thread and `done` is called on the main queue.
+    func grabFrame(fullQuality: Bool, done: @escaping (Data?) -> Void)
+    /// The phone's pinch: the picture fills the screen (cropped) or fits it, at once,
+    /// over whatever settings.cropMode opened it with. The TV never calls it.
+    func setPictureFill(_ fill: Bool)
+    /// The app left the screen (`true`) or came back (`false`) while this player keeps
+    /// going: the picture stops being drawn so the sound can carry on in the background, and is picked
+    /// up again at the same spot. The TV never calls it.
+    func appBackgrounded(_ on: Bool)
+}
+
+extension MPVPlayerController: PlayerEngineControlling {
+    var engineKind: PlayerEngineKind { .mpv }
+    // mpv.ts requestPiP() {} / exitPiP() {}: mpv draws into its own Metal layer, which AVKit's
+    // Picture in Picture cannot lift, so the control stays hidden on this engine.
+    var supportsPictureInPicture: Bool { false }
+    var isPictureInPictureActive: Bool { false }
+    func startPictureInPicture() {}
+    func stopPictureInPicture() {}
+}
+
+extension PlayerEngineControlling {
+    func appBackgrounded(_ on: Bool) {}
+    /// html5 bridge capabilities: no audio offset, no shaders, and a second subtitle only from the
+    /// engine's own (sideloaded) tracks. Sync and Look apply to every track on both engines: the
+    /// AVPlayer engine draws the file's own tracks too (NativePlayerController, NativeSubtitleOverlay).
+    var supportsMpvExtras: Bool { engineKind == .mpv }
+}
+
+/// lib/player/bridge.ts Chapter: a chapter's title and where it starts.
+struct PlayerChapter: Encodable, Equatable {
+    var title: String
+    var startSec: Double
+}
+
+/// The stream facts the Auto rule reads (engine/player.ts EngineHints), from the picked stream.
+struct PlayerStreamHints: Encodable {
+    var notWebReady: Bool?
+    var container: String?
+    var hdrFormat: String?
+    var filename: String?
+}
+
+/// engine/player.ts engineFor: the profile's playerEngine setting applied to one stream.
+enum PlayerEngineChoice {
+    struct Choice: Decodable {
+        var engine: PlayerEngineKind
+        /// settings.playerEngine: "auto" | "mpv" | "html5".
+        var want: String
+        var reason: String
+    }
+
+    private struct Input: Encodable {
+        var url: String
+        var isLive: Bool
+        var notWebReady: Bool?
+        var container: String?
+        var hdrFormat: String?
+        var filename: String?
+        var fallbackTried: Bool
+    }
+
+    /// Falls back to mpv, the engine that plays everything, when the engine cannot answer.
+    @MainActor static func choose(url: URL, isLive: Bool, hints: PlayerStreamHints?, fallbackTried: Bool = false) async -> Choice {
+        let p = ProfilesStore.shared.active
+        let input = Input(url: url.absoluteString, isLive: isLive, notWebReady: hints?.notWebReady, container: hints?.container,
+                          hdrFormat: hints?.hdrFormat, filename: hints?.filename, fallbackTried: fallbackTried)
+        do {
+            let c: Choice = try await HarborEngine.shared.call("player.engineFor", [p?.id ?? "default", p?.linked ?? true, input])
+            return c
+        } catch {
+            return Choice(engine: .mpv, want: "auto", reason: "default")
+        }
+    }
+}
+
+/// lib/player/playback-end.ts isNaturalEnd for a file the engine reports ended: no known duration
+/// (the snapshots fold an infinite live duration into 0), or at least END_RATIO (85 %) through. A
+/// stream cut short ends "ended" too but is neither watched nor followed by the next episode.
+/// One rule for mpv, AVPlayer and the live reload.
+enum PlaybackEnd {
+    static let endRatio = 0.85
+
+    static func isNatural(position: Double, duration: Double) -> Bool {
+        guard duration.isFinite, duration > 0 else { return true }
+        return position / duration >= endRatio
+    }
+}

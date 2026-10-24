@@ -1,0 +1,594 @@
+import Foundation
+import Combine
+import SwiftUI
+import UIKit
+
+/// Top-level flow: boot → onboarding (first run) → who's watching → shell.
+@MainActor
+final class AppModel: ObservableObject {
+    enum Stage: Equatable { case boot, onboarding, whoIsWatching, shell }
+
+    @Published var stage: Stage = .boot {
+        didSet { if stage != .shell { clearShownLinks() } }
+    }
+    @Published var room: Room = .home
+    /// A layer drawn in place over the room is up (the Collections room's collection
+    /// overlay): bp-shell passes no onTab while a layer is up, and the layer holds the focus, so the
+    /// top bar takes no focus and LB/RB turn no tabs until it closes.
+    @Published var roomLayer = false
+    /// Quick panel "Search": the Search room opens with this query.
+    @Published var searchSeed: String?
+    /// lib/deep-link.ts: a title opened from another app (harbor:// or stremio://).
+    @Published var deepLinkMeta: Meta?
+    @Published var deepLinkNote: String?
+
+    /// parseHarborOpen / parseStremioOpen / emitDeepLinkInstall, as the TV receives them.
+    /// A link is only recorded here, in DeepLinkQueue; the shell on screen
+    /// shows it (`showWaitingLink`) once nothing is presented over it. It used to be put straight
+    /// into the shell's cover binding: over a detail page, the player, a Settings or Addons cover, a
+    /// collection page or a page in the PiP browse layer, tvOS drops a second presentation from a
+    /// view that is already presenting, so the link never showed (and the binding stayed set).
+    /// The link also waits through boot (lifecycle pass: it no longer jumps to the shell mid-boot),
+    /// setup and Who's watching (the chooser opens over a profile that stays active, and a
+    /// link must not close it into that profile; upstream's picker layer stays up over it).
+    /// The old showLinkTarget() is gone: its guard (setup up and already finished)
+    /// could never hold, so it never moved a stage.
+    func handle(url: URL) {
+        let raw = url.absoluteString
+        let scheme = (url.scheme ?? "").lowercased()
+        guard scheme == "harbor" || scheme == "stremio" else { return }
+        // use-idle-screensaver.ts: any activity wakes it; a link
+        // arriving under the saver used to sit unseen until a press did. Never the curfew lock: that
+        // stays up (shellReachable) like "Ask a grown-up", and the link waits for it like the return
+        // prompt already does (promptHeldForCurfew).
+        Platform.hooks.wakeScreensaver()
+        // An install link closes the player first, like upstream's
+        // emitDeepLinkInstall → setView("addons"): App.tsx's setView resets the whole nav stack to a
+        // fresh Addons frame, the player's frame included (lib/view.tsx setView, the `v === "addons"`
+        // branch). It used to leave a film running behind the install dialog's wait for the shell.
+        if scheme == "stremio", raw.hasSuffix("manifest.json") { PlaybackState.shared.forceCloseIfPlaying() }
+        // A page that never showed is not "already on top": the same link sent again opens.
+        requeueDroppedLink()
+        let path = raw.dropFirst(scheme.count + 3)   // "scheme://"
+        let parts = path.split(separator: "/").map { String($0).removingPercentEncoding ?? String($0) }.filter { !$0.isEmpty }
+        if parts.first == "detail", parts.count >= 3 {
+            // lib/view.tsx openMeta: the title already on top is not opened again.
+            guard deepLinkMeta?.id != parts[2] else { return }
+            DeepLinkQueue.shared.add(.title(type: parts[1], id: parts[2]))
+            return
+        }
+        if scheme == "stremio", raw.hasSuffix("manifest.json") {
+            // addons.tsx onDeepLinkInstall → setInstallModal({ kind: "install", url }):
+            // the link opens the install dialog (AddonConfigureView reads it like install-modal's
+            // tryResolve: new, update, or a re-configure that replaces the old entry) and nothing is
+            // installed until Install is pressed. It used to install straight away, with no word to
+            // the viewer, whatever sent the link and whichever profile (a kid's too) was active, and
+            // a re-configured addon arrived as a second copy. ShellView shows it; like upstream's
+            // pendingUrl it waits for the shell when the link lands earlier.
+            guard deepLinkInstall?.url != raw else { return }
+            DeepLinkQueue.shared.add(.install(raw))
+        }
+    }
+
+    /// The shell itself is reachable: not behind the intro wall (a cold
+    /// launch), the curfew lock (never bypassed; a link waits for it like `promptWhoOnReturn` already
+    /// does) or the screensaver (`handle(url:)` wakes it, so this clears within its own poll once it
+    /// does). `showWaitingLink` / `requeueDroppedLink` gate on it alongside their own per-layer checks.
+    static var shellReachable: Bool {
+        !IntroModel.wallShowing && !CurfewState.shared.locked && !Platform.hooks.screensaverActive
+    }
+
+    /// The shell on screen shows the newest waiting link it may show, once
+    /// `clear` says nothing is presented over it (the caller polls: covers are not observable). One
+    /// at a time: the next waits until this one's page closes, so no two presentations race and none
+    /// is dropped. Taking the link out of the queue and setting the binding happen together on the
+    /// main actor, so a link opens once. A kid's shell (`kidShell`) takes titles only; a shared list
+    /// or an addon install waits for an adult shell (App.tsx pins a kid to kids / meta pages, and a
+    /// kid never gets the install dialog).
+    @discardableResult
+    func showWaitingLink(kidShell: Bool, clear: Bool) -> Bool {
+        // Not taken again in the same turn: the binding must land as nil first, or the
+        // cover would read the same item as unchanged and never present it.
+        if requeueDroppedLink(kidShell: kidShell) { return false }
+        guard stage == .shell, clear, deepLinkMeta == nil, deepLinkInstall == nil,
+              let entry = DeepLinkQueue.shared.take(kidShell: kidShell) else { return false }
+        linkAppeared = false
+        linkSetAt = Date()
+        linkQueuedAt = entry.at
+        switch entry.link {
+        case .title(let type, let id):
+            deepLinkMeta = Meta(id: id, type: type, name: "", poster: nil, background: nil, logo: nil, description: nil, releaseInfo: nil, releaseDate: nil,
+                                inTheaters: nil, imdbRating: nil, tmdbScore: nil, runtime: nil, genres: nil, adult: nil, isCollection: nil, providerBadge: nil, videos: nil)
+        case .install(let raw):
+            deepLinkInstall = DeepLinkInstall(url: raw)
+        }
+        return true
+    }
+
+    /// Whether the deep-link page last asked for has come on screen (its cover content's
+    /// onAppear), when its binding was set and when its link first arrived. Setting the binding was
+    /// taken as showing it, and nothing went back in the queue when it did not show: tvOS drops a
+    /// present that races another (a tile pressed in the same instant, a cover still animating
+    /// away), and a kid's shell has no cover at all for a list or an install an adult shell had up
+    /// when a profile sync turned the profile into a kid's. The binding then stayed set with nothing
+    /// on screen: every later link waited behind it for good, and the same link sent again read as
+    /// "already on top" and was ignored.
+    private var linkAppeared = false
+    private var linkSetAt = Date.distantPast
+    private var linkQueuedAt = Date()
+
+    /// The deep-link page is on screen (ShellView / KidsShellView cover content).
+    func deepLinkCoverAppeared() { linkAppeared = true }
+
+    /// A deep-link binding is set and its page has not come up yet: the shell keeps
+    /// checking (`showWaitingLink`) until it has, or until the link is put back in the queue.
+    var deepLinkUnconfirmed: Bool {
+        !linkAppeared && (deepLinkMeta != nil || deepLinkInstall != nil)
+    }
+
+    /// Nothing is presented over this model's shell: the main window's root, or the PiP
+    /// browse layer's while this is the layer's model and its window is up.
+    private var shellUncovered: Bool {
+        guard Self.shellReachable else { return false }
+        if isBrowseLayer { return Platform.hooks.pipLayerUncovered(for: self) }
+        return Platform.hooks.mainWindowUncovered
+    }
+
+    /// A binding set over 2 s ago whose page never appeared, with nothing presented over
+    /// the shell, was dropped: clear it and put its link back to wait again (a list or an install
+    /// under a kid's shell waits for an adult shell), keeping the link's age. `kidShell`: a kid's
+    /// shell has no cover for a list or an install at all, so one of those is put back even after
+    /// it appeared (in the adult shell the profile was before a sync made it a kid's).
+    @discardableResult
+    private func requeueDroppedLink(kidShell: Bool = false) -> Bool {
+        let kidCannotShow = kidShell && deepLinkInstall != nil
+        guard kidCannotShow || (deepLinkUnconfirmed && Date().timeIntervalSince(linkSetAt) > 2 && shellUncovered) else { return false }
+        let queue = DeepLinkQueue.shared
+        if let m = deepLinkMeta {
+            deepLinkMeta = nil
+            queue.add(.title(type: m.type, id: m.id), at: linkQueuedAt)
+        }
+        if let i = deepLinkInstall {
+            deepLinkInstall = nil
+            queue.add(.install(i.url), at: linkQueuedAt)
+        }
+        return true
+    }
+
+    /// The shell's deep-link covers go with the shell when the stage leaves it (Who's watching, setup):
+    /// the bindings are cleared, so a page the viewer never closed does not come back (or block the
+    /// next link) when a shell appears again.
+    private func clearShownLinks() {
+        if deepLinkMeta != nil { deepLinkMeta = nil }
+        if deepLinkInstall != nil { deepLinkInstall = nil }
+    }
+
+    /// lib/deep-link.ts emitDeepLinkInstall's pending URL, until ShellView's install dialog takes it.
+    struct DeepLinkInstall: Identifiable, Equatable {
+        let id = UUID()
+        let url: String
+    }
+    @Published var deepLinkInstall: DeepLinkInstall?
+
+    /// A link this shell may show is waiting, or the one just shown has not come on
+    /// screen yet (ShellView / KidsShellView poll while either holds).
+    func hasWaitingLink(kidShell: Bool) -> Bool { DeepLinkQueue.shared.hasWaiting(kidShell: kidShell) || deepLinkUnconfirmed }
+
+    /// Rooms read through this; swapped for the engine-backed source in .
+    var browseSource: BrowseSource = (Fixtures.active && !Fixtures.liveRooms) ? FixtureBrowseSource() : EngineBrowseSource()
+    /// The Apple TV's Home: the active profile's HomeLayout over `browseSource`. Made on
+    /// first use, so the iPhone (which reads its Home through HomeLayoutLoader) never builds one.
+    lazy var homeLayoutSource = HomeLayoutBrowseSource(base: browseSource)
+    /// Bumped when Edit Home closes on a changed layout: Home opens again from the top on its first
+    /// card (ShellView keys the room on it), as it does at launch.
+    @Published var homeGeneration = 0
+    let profiles = ProfilesStore.shared
+    /// Search and Library state kept across tab switches (Shell/ShellViewState.swift).
+    let views = ShellViewState()
+    /// Bumped on every change of the active profile (the reset below), so a
+    /// page can tell whether the profile it left the shell on is still the one it comes back to.
+    private(set) var profileSwitches = 0
+
+    private var bag = Set<AnyCancellable>()
+    private let isBrowseLayer: Bool
+
+    /// `isBrowseLayer`: the PiP browse layer's own model (Player/PiPBrowse.swift). It leaves the
+    /// app-wide reloads a profile switch makes to the app's model (which runs them once), and the
+    /// layer goes down on a switch anyway.
+    init(isBrowseLayer: Bool = false) {
+        self.isBrowseLayer = isBrowseLayer
+        // The active profile can disappear (deleted from Who's watching, or its id cleared by the engine):
+        // the shell must go back to who-is-watching.
+        profiles.$activeId.dropFirst().receive(on: RunLoop.main).sink { [weak self] id in
+            guard let self, id == nil, self.stage == .shell else { return }
+            self.stage = .whoIsWatching
+        }.store(in: &bag)
+        // use-bp-profile-reset resetBpViewState: another profile gets a fresh Search and Library.
+        // Synchronously, not on the next run-loop turn: a pick on Who's watching sets
+        // the profile and the shell stage in one action, so the shell was built (Search open) on
+        // the previous profile's SearchModel before the reset landed, and the new profile saw the
+        // last one's query and results until the shell happened to redraw.
+        // removeDuplicates before dropFirst, so it compares with the restored id: the
+        // other way round the first emission always passed, and the first roster reload that
+        // rewrote the same active id (a sign-in's pull from Settings) counted as a switch and
+        // pulled the viewer to Home.
+        profiles.$activeId.removeDuplicates().dropFirst().sink { [weak self] _ in
+            guard let self else { return }
+            self.views.reset()
+            self.profileSwitches &+= 1
+            // use-bp-profile-reset onSwitch → goBigPictureTab("home"): "Home is
+            // the only route guaranteed to exist for whoever just arrived". The next profile opened
+            // on the room the last one left (their Library, Live TV or Settings, which may be a
+            // room this profile has hidden or locked, or never set up).
+            if self.room != .home { self.room = .home }
+        }.store(in: &bag)
+        guard !isBrowseLayer else { return }
+        // lib/profiles.tsx window "focus": back in front after the prompt interval, Who's watching.
+        NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                Task { @MainActor in await self?.promptWhoOnReturn() }
+            }.store(in: &bag)
+        // A return prompt held back by the curfew lock (returnPromptClear) is asked again
+        // when the lock lifts (the parent PIN, the next day): upstream's picker opened under the lock
+        // and is what the viewer finds once it goes.
+        CurfewState.shared.$locked.removeDuplicates().dropFirst().receive(on: RunLoop.main).sink { [weak self] locked in
+            guard let self, !locked, self.promptHeldForCurfew else { return }
+            self.promptHeldForCurfew = false
+            Task { @MainActor in await self.promptWhoOnReturn() }
+        }.store(in: &bag)
+        // Settings (and so the theme and display language) can be per profile: a switch re-reads them.
+        profiles.$activeId.removeDuplicates().dropFirst().receive(on: RunLoop.main).sink { id in
+            guard id != nil, !Fixtures.active else { return }
+            Task { @MainActor in
+                await SettingsBridge.shared.load()
+                await ThemeStore.shared.load()
+            }
+        }.store(in: &bag)
+    }
+
+    private static let onboardingKey = "harbor.onboarding.bp"
+    var onboardingDone: Bool {
+        get { Prefs.get(Bool.self, for: Self.onboardingKey) ?? false }
+        set { try? Prefs.set(newValue, for: Self.onboardingKey) }
+    }
+
+    func boot() async {
+        Platform.hooks.installActivityMonitor()
+        Fixtures.installIfRequested(into: self)
+        if !Fixtures.active {
+            // The first `HarborEngine.shared` evaluates the ~4.4 MB bundle and reads
+            // every stored key; SettingsBridge.load() below made it on the main actor, freezing the
+            // boot splash (and every press) for seconds on an Apple TV. Build it off the main thread.
+            _ = await Task.detached(priority: .userInitiated) { (try? HarborEngine.sharedOrThrow()) != nil }.value
+            // Background/foreground and the network path reach the engine (visibilitychange, online).
+            AppLifecycle.shared.start()
+            await SettingsBridge.shared.load()
+            // the profile's theme is painted from the first Big Picture frame.
+            await ThemeStore.shared.load()
+            // App.tsx MediaServerSyncRunner: due home-server indexes at launch, then every 15 minutes.
+            _ = try? await HarborEngine.shared.callJSON("homeServers.startRunner", [])
+            // Harbor shutdown D: Watchlist entries that only exist on this TV go to the Stremio library
+            // (engine/watchlistPush.ts). Off the boot path: it reads the library over the network.
+            Task { _ = try? await HarborEngine.shared.callJSON("watchlistPush.run", [.string("launch")]) }
+        }
+        try? await Task.sleep(for: .seconds(Fixtures.active ? 0.2 : 1.2))
+        if let fixed = Fixtures.stage {
+            if Fixtures.openSpikes { room = .settings }
+            stage = fixed
+            return
+        }
+        // After Finish later the app runs on profiles while setup stays unfinished. A kid
+        // profile never gets setup (App.tsx pins a kid to the Kids surface, where bp-shell's
+        // onboarding gate is not mounted): it opened adult setup over the kid's profile, before the
+        // curfew lock started.
+        // bp-shell.tsx mounts BpWhoIsWatching over BpOnboarding (z-80 over
+        // z-60), so a setup resumed over existing profiles waits under the launch path: the "Start
+        // as" default, Who's watching at launch (a PIN profile asks for its PIN) and a kid's PIN lock
+        // come first, and setup then edits the profile that was picked. First run (no profiles yet)
+        // still opens setup straight away.
+        if !onboardingDone {
+            if profiles.profiles.isEmpty {
+                stage = .onboarding
+                return
+            }
+            setupWaiting = true
+        }
+        await goToWhoOrShellAtLaunch()
+    }
+
+    /// bp-onboarding.tsx useBpOnboardingGate `open` (!onboarded && !snoozed)
+    /// for a setup that waits under Who's watching: set at launch when setup is unfinished and
+    /// profiles exist, cleared when setup is left (Start watching, Finish later, Do not show this
+    /// again). While it is set, leaving Who's watching onto an adult profile opens setup; a kid
+    /// profile goes to the Kids surface, where upstream's gate is not mounted.
+    private var setupWaiting = false
+
+    /// Where the app goes once a profile is active: setup when it waits for an adult profile,
+    /// else the shell.
+    /// With no profile active (the pick was removed by a roster sync while
+    /// pickedOnWho loaded its settings) it is Who's watching: `active?.kid == nil` read true for a
+    /// missing profile, so setup opened for nobody.
+    private var stageAfterPick: Stage {
+        guard let active = profiles.active else { return .whoIsWatching }
+        return setupWaiting && !onboardingDone && active.kid == nil ? .onboarding : .shell
+    }
+
+    /// Setup closing (Start watching, Finish later, Do not show this again). A setup resumed over
+    /// existing profiles already went through the launch path before it opened, so it closes onto
+    /// the profile it edited.
+    private func leaveSetup() {
+        setupWaiting = false
+        goToWhoOrShell()
+    }
+
+    /// about-tab.tsx OnboardingRow "Replay walkthrough": useOnboarding
+    /// resetOnboarding clears the finished flag (the TV has no dismissed tips to clear) and
+    /// bp-shell's gate opens setup over the room at once. The resume cursor is left alone, as
+    /// upstream's: a finished setup cleared it, so setup opens on its first screen; one left with
+    /// Finish later picks up where it was. Nothing else is reset: profiles, sign-ins and settings
+    /// stay, and leaving setup returns to the active profile's shell. Settings is an adult room
+    /// (a kid profile has none), so a kid never starts it.
+    func replayOnboarding() {
+        guard !isBrowseLayer, stage == .shell, let active = profiles.active, active.kid == nil else { return }
+        onboardingDone = false
+        stage = .onboarding
+    }
+
+    /// lib/profiles.tsx at launch (engine `profilesRoom.launchPicker`): a
+    /// "Start as" default profile opens directly, and with several profiles Who's watching comes
+    /// up over the restored one (profilePromptInterval, every launch by default; Back closes it).
+    /// The TV only asked when no profile was active, so it always woke in whoever used it last.
+    private func goToWhoOrShellAtLaunch() async {
+        struct Launch: Decodable { var open: Bool; var defaultId: String? }
+        // A kid profile behind a parent PIN is left only through that PIN (KidsShellView's chip), so
+        // neither the prompt nor a default takes it away at launch: quitting and reopening the app
+        // must not be a way around the PIN (or the curfew lock).
+        let kidLocked = profiles.active?.kid?.parentPinHash != nil
+        guard !Fixtures.active, !kidLocked, let launch: Launch = try? await HarborEngine.shared.call("profilesRoom.launchPicker", []) else {
+            goToWhoOrShell()
+            return
+        }
+        if let id = launch.defaultId, id != profiles.activeId,
+           let target = profiles.profiles.first(where: { $0.id == id }), target.passwordHash == nil {
+            profiles.select(id)
+            // Boot loaded the restored profile's settings and theme; the "Start as"
+            // profile's arrived only through the activeId sink, after the stage below was set. The
+            // shell painted the previous profile's theme and language, then rebuilt; a resumed
+            // setup opened in the old theme (held until setup ends) and flipped language mid-step.
+            await SettingsBridge.shared.load()
+            await ThemeStore.shared.load()
+        }
+        if launch.open, profiles.active != nil {
+            stage = .whoIsWatching
+            return
+        }
+        goToWhoOrShell()
+    }
+
+    /// lib/profiles.tsx:569-580 (the window "focus" listener): Harbor coming back to the front asks
+    /// Who's watching again once profilePromptInterval (15m / 30m) has passed since the last pick
+    /// (engine `profilesRoom.returnPicker`). tvOS resumes the app rather than relaunching it, so the
+    /// launch path alone never asked. Like that path, a kid behind a parent PIN is never taken off
+    /// its profile this way, and like the profile chip it opens over the profile in use (Back
+    /// returns to it). Not over a film (leaving the shell would close the player) or setup.
+    private func promptWhoOnReturn() async {
+        promptHeldForCurfew = false
+        guard stage == .shell, !Fixtures.active, profiles.active?.kid?.parentPinHash == nil,
+              returnPromptClear else { return }
+        guard let open: Bool = try? await HarborEngine.shared.call("profilesRoom.returnPicker", []), open else { return }
+        guard stage == .shell, returnPromptClear else { return }
+        if CurfewState.shared.locked {
+            promptHeldForCurfew = true
+            return
+        }
+        stage = .whoIsWatching
+    }
+
+    /// The return prompt came due under the curfew lock; the lock lifting asks again.
+    private var promptHeldForCurfew = false
+
+    /// Upstream's picker is a modal over whatever is open, and closing it returns there.
+    /// Here Who's watching replaces the shell, which tears down anything presented over it: a
+    /// Detail page, a Settings cover, a PIN pad mid-entry or a room's in-place layer were gone
+    /// after Back. So the return prompt only replaces a bare room.
+    /// Nor under the curfew lock: curfew-guard sits over every Big Picture layer,
+    /// the picker included, so upstream's focus prompt opens under it and "Time's up!" is still
+    /// what the viewer sees. Here Who's watching replaces the shell and the lock went with it
+    /// (ShellOverlay only covers the shell stage): a kid without a parent PIN came back after the
+    /// prompt interval to the chooser, with no lock and no "Ask a grown-up" (its own Switch
+    /// profile button is the lock's way out). promptWhoOnReturn holds the prompt
+    /// until the lock lifts instead of dropping it.
+    private var returnPromptClear: Bool {
+        !PlaybackState.shared.active && !Platform.hooks.pipBrowseUp && Platform.hooks.mainWindowUncovered
+            && !roomLayer
+    }
+
+    func finishOnboarding() {
+        onboardingDone = true
+        OnboardingResume.clear()
+        if profiles.profiles.isEmpty { profiles.seedIfEmpty(name: "Harbor") }
+        attachPendingStremio()
+        leaveSetup()
+    }
+
+    /// bp-onboarding.tsx BpOnboardingGate.suspend, "Finish later": setup closes
+    /// for this run only. The finished flag stays unset and the saved step stays, so the next launch
+    /// opens setup where it was left; meanwhile the app runs on a first profile as after setup.
+    func suspendOnboarding() {
+        if profiles.profiles.isEmpty { profiles.seedIfEmpty(name: "Harbor") }
+        attachPendingStremio()
+        leaveSetup()
+    }
+
+    /// A Stremio sign-in made before profiles existed goes to the primary profile.
+    func attachPendingStremio() {
+        guard let s = PendingStremio.session,
+              let target = profiles.profiles.first(where: { $0.isPrimary }) ?? profiles.profiles.first else { return }
+        profiles.setStremioSession(s, for: target.id)
+        PendingStremio.session = nil
+    }
+
+    func goToWhoOrShell() {
+        stage = profiles.active == nil ? .whoIsWatching : stageAfterPick
+    }
+
+    /// bp-who-is-watching-layer: the chooser opens over the profile in use,
+    /// which stays active until another is picked, so Back returns to it (`canClose`) and picking
+    /// it again just closes. The switch used to clear the active profile first: Back on Who's
+    /// watching then left the app, re-picking your own PIN profile asked for its PIN again, and a
+    /// parental unlock was dropped.
+    /// The PiP browse layer still clears it: that is what takes the layer and its film down and
+    /// sends the app's own shell to Who's watching (PiPBrowse.profileChanged, the sink in init).
+    func switchProfile() {
+        if isBrowseLayer { profiles.deselect() }
+        stage = .whoIsWatching
+    }
+
+    /// Who's watching may close back to the shell: there is a profile behind it.
+    var canCloseWho: Bool { profiles.active != nil }
+
+    func closeWho() {
+        guard canCloseWho else { return }
+        stage = stageAfterPick
+    }
+
+    /// bp-who-is-watching commit(): a profile was picked (after its PIN, if it has one). Setup
+    /// waiting under the chooser continues for it, else the shell opens.
+    func pickedOnWho() {
+        guard stageAfterPick == .onboarding, !Fixtures.active else {
+            stage = stageAfterPick
+            return
+        }
+        // Setup holds the theme while it runs (ThemeStore.holding) and a new language rebuilds the
+        // tree, so the picked profile's settings and theme land before setup opens on them. The
+        // activeId sink reloads them too; a second load reads the same stored values.
+        Task { @MainActor in
+            await SettingsBridge.shared.load()
+            await ThemeStore.shared.load()
+            guard self.stage == .whoIsWatching else { return }
+            self.stage = self.stageAfterPick
+        }
+    }
+}
+
+/// lib/deep-link.ts links that have arrived and not been shown yet. One
+/// queue for the app: the PiP browse layer's model and the app's own both show from it, so a link
+/// still waiting when the layer goes down opens in the app's shell instead of going with the
+/// layer's model. Upstream pushes each link as a frame on its view stack (lib/view.tsx openMeta /
+/// openList) and Back walks down them; the newest is shown first here too, then the older ones as
+/// each page closes.
+@MainActor
+final class DeepLinkQueue: ObservableObject {
+    static let shared = DeepLinkQueue()
+
+    enum Link: Equatable {
+        /// parseHarborOpen / parseStremioOpen: a title page.
+        case title(type: String, id: String)
+        /// emitDeepLinkInstall: a stremio://…/manifest.json install link.
+        case install(String)
+
+        /// A kid's shell shows titles only (as its kids detail page).
+        var kidSafe: Bool {
+            switch self {
+            case .title: return true
+            case .install: return false
+            }
+        }
+    }
+
+    /// A waiting link and when it arrived.
+    struct Entry: Equatable {
+        let link: Link
+        let at: Date
+    }
+
+    @Published private(set) var waiting: [Entry] = []
+    /// A burst of links keeps its newest few.
+    private static let cap = 8
+    /// How long a link may wait. Upstream opens a link at once (openMeta even unmounts
+    /// the player), so it never waits at all; here one sent during a film waited for the player,
+    /// then for the film's own detail page to close, and popped up over Home hours later, long after
+    /// anyone remembered sending it. The wait still covers a cold launch through boot, the intro,
+    /// Who's watching and a PIN.
+    private static let maxWait: TimeInterval = 10 * 60
+
+    /// A link sent again moves up to newest instead of waiting twice. `at`: when it first arrived
+    /// (a link put back after a dropped present keeps its age, so it still expires; one
+    /// sent again starts its wait afresh).
+    func add(_ link: Link, at: Date = Date()) {
+        let latest = waiting.first(where: { $0.link == link }).map { max($0.at, at) } ?? at
+        waiting.removeAll { $0.link == link }
+        waiting.append(Entry(link: link, at: latest))
+        if waiting.count > Self.cap { waiting.removeFirst(waiting.count - Self.cap) }
+    }
+
+    func hasWaiting(kidShell: Bool) -> Bool {
+        dropStale()
+        return waiting.contains { !kidShell || $0.link.kidSafe }
+    }
+
+    /// The newest link a shell may show, out of the queue.
+    func take(kidShell: Bool) -> Entry? {
+        dropStale()
+        guard let i = waiting.lastIndex(where: { !kidShell || $0.link.kidSafe }) else { return nil }
+        return waiting.remove(at: i)
+    }
+
+    /// Links older than `maxWait` are dropped unshown.
+    private func dropStale() {
+        let now = Date()
+        guard waiting.contains(where: { now.timeIntervalSince($0.at) > Self.maxWait }) else { return }
+        waiting.removeAll { now.timeIntervalSince($0.at) > Self.maxWait }
+    }
+}
+
+enum Room: String, CaseIterable, Identifiable {
+    case home, discover, anime, shows, movies, live, sports, search, calendar, library, collections, settings
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .home: return "Home"
+        case .discover: return "Discover"
+        case .anime: return "Anime"
+        case .shows: return "Shows"
+        case .movies: return "Movies"
+        case .live: return "Live TV"
+        case .sports: return "Sports"
+        case .search: return "Search"
+        case .calendar: return "Calendar"
+        case .library: return "Library"
+        case .collections: return "Collections"
+        case .settings: return "Settings"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .home: return "house.fill"
+        case .discover: return "safari.fill"
+        case .anime: return "sparkles"
+        case .shows: return "tv"
+        case .movies: return "film"
+        case .live: return "antenna.radiowaves.left.and.right"
+        case .sports: return "sportscourt"
+        case .search: return "magnifyingglass"
+        case .calendar: return "calendar"
+        case .library: return "books.vertical"
+        case .collections: return "square.grid.2x2"
+        case .settings: return "gearshape.fill"
+        }
+    }
+    /// Which plan stage delivers the room, for the placeholder screens.
+    var arrivesIn: Int {
+        switch self {
+        case .home, .discover, .shows, .movies, .search, .collections: return 2
+        case .library, .calendar: return 5
+        case .anime: return 7
+        case .live: return 8
+        case .sports: return 11
+        case .settings: return 1
+        }
+    }
+    static var tabs: [Room] { allCases.filter { $0 != .settings } }
+}

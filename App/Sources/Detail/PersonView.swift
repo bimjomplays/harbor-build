@@ -1,0 +1,256 @@
+import SwiftUI
+
+
+struct PersonView: View {
+    @StateObject private var model: PersonModel
+    let name: String
+    @State private var detail: Meta?
+    @State private var other: PersonModel.Collaborator?
+    @State private var bioExpanded = false
+    /// SH-1 (bp-ambient.tsx TITLE_ART_ROUTES includes "person"): the focused credit's own art
+    /// cross-fades in over the mosaic, same as Collections/Library. Known For, IMDb Top and each
+    /// filmography row already hand back the focused Meta; only the ambient wasn't reading it.
+    @State private var focusedMeta: Meta?
+    /// The Sort / Rating chips ("Sort:popularity", "Rating:0" …), so the empty state's "Any rating"
+    /// can hand the ring to the Rating row's "Any rating" before it goes away.
+    @FocusState private var chipFocus: String?
+    @Environment(\.dismiss) private var dismiss
+    /// bp-person.tsx autofocusFirst: the page opens with the ring on the first
+    /// credit of Known For (else IMDb Top, else the first filmography row). The ring sat on Back,
+    /// the only thing on screen while the page loaded, so one Select closed the page.
+    @FocusState private var backFocused: Bool
+    @Namespace private var personNS
+    @Environment(\.resetFocus) private var resetFocus
+    /// The row and cell that take the ring once, as the first read lands.
+    @State private var lead: LeadCell?
+    struct LeadCell: Equatable { var row: String; var cell: String }
+
+    /// Set when the page is drawn inside the player (PlayerXRay.swift, xray-overlay.tsx CastModal
+    /// without onOpenDetail/onPlay): Back and Menu call it instead of dismissing the presentation
+    /// (the player's own cover), and titles and collaborators stay put, because a fullScreenCover
+    /// over the player makes it disappear (PlaybackState, the torrent's owner).
+    let onClose: (() -> Void)?
+
+    init(personId: Int, name: String, onClose: (() -> Void)? = nil) {
+        _model = StateObject(wrappedValue: PersonModel(personId: personId)); self.name = name; self.onClose = onClose
+    }
+
+    private func close() { if let onClose { onClose() } else { dismiss() } }
+    private func openTitle(_ m: Meta) { if onClose == nil { detail = m } }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            BPAmbientBackground(focused: focusedMeta)
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: BP.px(24)) {
+                    hero.padding(.horizontal, BP.gutter)
+                    if let pg = model.page {
+                        // bp-person.tsx's no-key BpEmptyState copy (the TV has no Setup to open).
+                        if !pg.hasKey { BPNote(text: "Filmographies come from TMDB. Add a key in Setup to fill this page.").padding(.horizontal, BP.gutter) }
+                        if let k = pg.knownFor, !k.isEmpty { BPRowView(row: BrowseRow(key: "knownFor", title: T("Known For"), metas: k), onFocus: { focusedMeta = $0 }, onSelect: { openTitle($0) }, restoreCell: leadCell("knownFor")) }
+                        if let t = pg.topRated, !t.isEmpty { BPRowView(row: BrowseRow(key: "topRated", title: T("IMDb Top"), metas: t), onFocus: { focusedMeta = $0 }, onSelect: { openTitle($0) }, restoreCell: leadCell("topRated")) }
+                        if let c = pg.collaborators, c.count >= 3 { collaborators(c) }
+                        // bp-person.tsx: the Filmography heading and the Sort / Rating rows stand while
+                        // the person has any credit (total > 0). They hung off the
+                        // filtered sections, so a Rating pick that no title cleared took the chips
+                        // (and the ring) away with no way back to "Any rating" short of leaving.
+                        if (pg.total ?? 0) > 0 {
+                            VStack(alignment: .leading, spacing: BP.px(10)) {
+                                Text("Filmography").font(BP.display(24)).foregroundStyle(BP.ink).accessibilityAddTraits(.isHeader)
+                                filterRow("Sort", [("popularity", "Popularity"), ("rating", "Rating"), ("newest", "Newest")], active: model.sort, trailing: T("%lld of %lld", pg.shownTotal ?? 0, pg.total ?? 0)) { model.sort = $0; Task { await model.load() } }
+                                filterRow("Rating", [("0", "Any rating"), ("6", T("Rated %lld+", 6)), ("7", T("Rated %lld+", 7)), ("8", T("Rated %lld+", 8))], active: String(model.minRating), trailing: nil) { model.minRating = Int($0) ?? 0; Task { await model.load() } }
+                                // bp-person.tsx BpFilterRow caption (filmography-rank.ts
+                                // MIN_VOTES_MOVIE 200, MIN_VOTES_TV 100): why a well-known title can drop out.
+                                Text(verbatim: T("Ratings count from %lld+ votes, %lld+ for TV", 200, 100))
+                                    .font(BP.sans(12)).foregroundStyle(BP.inkSubtle)
+                                    .padding(.leading, BP.px(88))
+                            }
+                            .padding(.horizontal, BP.gutter)
+                        }
+                        ForEach(pg.sections ?? []) { s in BPRowView(row: BrowseRow(key: "film:\(s.id)", title: s.title, metas: s.metas), onFocus: { focusedMeta = $0 }, onSelect: { openTitle($0) }, restoreCell: leadCell("film:\(s.id)")) }
+                        // bp-person.tsx BpEmptyState when nothing is shown (the no-key note is above).
+                        if pg.hasKey, !model.loading, (pg.shownTotal ?? 0) == 0 {
+                            VStack(alignment: .leading, spacing: BP.px(10)) {
+                                if (pg.total ?? 0) > 0 {
+                                    BPNote(text: "No titles clear that rating.")
+                                    // The button leaves with the empty state the
+                                    // moment the load starts; the ring goes to the Rating row's
+                                    // "Any rating" chip, which stays (total > 0).
+                                    Button("Any rating") {
+                                        model.minRating = 0
+                                        chipFocus = "Rating:0"
+                                        Task { await model.load() }
+                                    }
+                                    .buttonStyle(BPActionStyle(primary: true))
+                                } else {
+                                    BPNote(text: "No filmography on record.")
+                                }
+                            }
+                            .padding(.horizontal, BP.gutter)
+                        }
+                    } else if model.loading {
+                        ProgressView().tint(BP.inkMuted).padding(.horizontal, BP.gutter)
+                    } else {
+                        // A failed first read left the name and Back alone.
+                        VStack(alignment: .leading, spacing: BP.px(10)) {
+                            BPNote(text: "Something went wrong. Try again.")
+                            Button("Try again") { Task { await model.load() } }.buttonStyle(BPActionStyle(primary: true))
+                        }
+                        .padding(.horizontal, BP.gutter)
+                    }
+                    Color.clear.frame(height: BP.hintHeight + BP.px(40))
+                }
+                .padding(.top, BP.px(40))
+            }
+            // The rows' restoreCell prefers default focus in this page's own scope (BPRowView reads
+            // the namespace from the environment; the shell's is behind this cover).
+            .focusScope(personNS)
+            .environment(\.shellFocusNamespace, personNS)
+        }
+        // Load once: the task runs again whenever a title or collaborator cover
+        // closes, and refetched the whole page each time (person-updated still refreshes it).
+        .task {
+            guard model.page == nil else { return }
+            await model.load()
+            seedLead()
+        }
+        .onExitCommand { close() }
+        .fullScreenCover(item: $detail) { m in DetailView(meta: m) }
+        .fullScreenCover(item: $other) { c in PersonView(personId: c.id, name: c.name) }
+    }
+
+    /// bp-person.tsx: the department as the eyebrow, then "Top {n}" as a quiet pill. A rank is
+    /// neither actionable nor live, so it never takes focus.
+    private func eyebrow(_ p: PersonModel.Person) -> some View {
+        HStack(spacing: BP.px(10)) {
+            if !p.department.isEmpty {
+                Text(verbatim: p.department).font(BP.sans(13, .semibold)).textCase(.uppercase).tracking(BP.px(2.1)).foregroundStyle(BP.inkSubtle)
+            }
+            if let top = p.topLabel {
+                Text(verbatim: top).font(BP.sans(12, .bold)).textCase(.uppercase).tracking(BP.px(1.7)).monospacedDigit()
+                    .foregroundStyle(BP.ink)
+                    .padding(.horizontal, BP.px(10)).padding(.vertical, BP.px(3))
+                    .background(Capsule().fill(BP.void_.opacity(0.85)))
+                    .overlay(Capsule().stroke(BP.edge2, lineWidth: 1))
+            }
+        }
+        // bp-person.tsx: the department eyebrow and the "Top {n}" pill read as one line, not two stops.
+        .accessibilityElement(children: .combine)
+    }
+
+    private var hero: some View {
+        HStack(alignment: .top, spacing: BP.px(24)) {
+            ZStack {
+                Circle().fill(BP.panel2)
+                // bp-person.tsx portrait img alt="": the name text beside it names the person.
+                if let p = model.page?.person?.portrait { RemoteImage(url: p).clipShape(Circle()).accessibilityHidden(true) } else { Image(systemName: "person.fill").accessibilityHidden(true).font(.system(size: BP.px(48))).foregroundStyle(BP.inkSubtle) }
+            }
+            .frame(width: BP.px(160), height: BP.px(160))
+            VStack(alignment: .leading, spacing: BP.px(8)) {
+                if let p = model.page?.person, !p.department.isEmpty || p.topLabel != nil { eyebrow(p) }
+                Text(model.page?.person?.name ?? name).font(BP.display(40)).foregroundStyle(BP.ink)
+                if let p = model.page?.person {
+                    let factLine: String = p.facts.filter { !$0.isEmpty }.joined(separator: " · ")
+                    if !factLine.isEmpty { Text(factLine).font(BP.sans(14, .medium)).foregroundStyle(BP.inkMuted) }
+                    if let a = model.page?.awards, !a.isEmpty {
+                        Text(a.prefix(4).map(Self.awardLine).joined(separator: " · "))
+                            .font(BP.sans(12)).foregroundStyle(BP.inkSubtle).lineLimit(1)
+                    }
+                    if !p.biography.isEmpty {
+                        Button { bioExpanded.toggle() } label: {
+                            Text(p.biography).font(BP.sans(13)).foregroundStyle(BP.inkMuted).lineSpacing(4).lineLimit(bioExpanded ? nil : 4).frame(maxWidth: BP.px(760), alignment: .leading)
+                        }
+                        .buttonStyle(.plain)
+                        // bp-person.tsx's own "Read more" / "Show less" chip toggles this text there;
+                        // here the paragraph itself is the toggle, so VoiceOver needs the same word for what Select does.
+                        .accessibilityHint(T(bioExpanded ? "Show less" : "Read more"))
+                    }
+                }
+                Button { close() } label: { Label("Back", systemImage: "chevron.backward") }.buttonStyle(BPActionStyle())
+                    .focused($backFocused)
+            }
+        }
+        .focusSection()
+    }
+
+    /// The cell a row hands the ring to on the first landing (nil for every other row).
+    private func leadCell(_ row: String) -> String? {
+        guard let lead, lead.row == row else { return nil }
+        return lead.cell
+    }
+
+    /// bp-person.tsx focusId: knownFor, else topRated, else the first section. Only while the ring is
+    /// still on Back from the open (a viewer who already moved keeps their spot), and not inside the
+    /// player's X-Ray, whose titles do not open.
+    private func seedLead() {
+        guard onClose == nil, backFocused, let pg = model.page else { return }
+        var next: LeadCell? = nil
+        if let m = pg.knownFor?.first {
+            next = LeadCell(row: "knownFor", cell: m.id)
+        } else if let m = pg.topRated?.first {
+            next = LeadCell(row: "topRated", cell: m.id)
+        } else if let s = pg.sections?.first(where: { !$0.metas.isEmpty }), let m = s.metas.first {
+            next = LeadCell(row: "film:" + s.id, cell: m.id)
+        }
+        guard let next else { return }
+        lead = next
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            guard backFocused else { return }
+            resetFocus(in: personNS)
+        }
+        // Once the ring has had its chance, the cell stops preferring default focus.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { lead = nil }
+    }
+
+    /// bp-person.tsx BpPersonAwards: "{n} win(s)" (else "{n} nom(s)"), then the nominations beside a
+    /// win, under the award body (a proper noun, left untranslated like upstream).
+    private static func awardLine(_ a: PersonModel.Award) -> String {
+        let noms = a.nominations == 1 ? T("%lld nom", a.nominations) : T("%lld noms", a.nominations)
+        let headline = a.wins > 0 ? (a.wins == 1 ? T("%lld win", a.wins) : T("%lld wins", a.wins)) : noms
+        // AWARD_CATALOG[a.type]?.shorthand ?? t("Award"), raw like upstream.
+        let body: String = a.shorthand ?? T("Award")
+        return "\(body): \(headline)" + (a.wins > 0 && a.nominations > 0 ? ", \(noms)" : "")
+    }
+
+    // bp-collaborators: round portraits with the shared-title count and role.
+    private func collaborators(_ people: [PersonModel.Collaborator]) -> some View {
+        VStack(alignment: .leading, spacing: BP.px(10)) {
+            Text("Frequent Collaborators").font(BP.sans(19, .bold)).foregroundStyle(BP.ink).padding(.horizontal, BP.gutter).accessibilityAddTraits(.isHeader)
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: BP.trackGap) {
+                    ForEach(people.prefix(18)) { c in
+                        Button { if onClose == nil { other = c } } label: {
+                            VStack(spacing: BP.px(8)) {
+                                ZStack {
+                                    Circle().fill(BP.panel2)
+                                    // bp-collaborators.tsx img alt="": the name and title count below already name the cell.
+                                    if let p = c.portrait { RemoteImage(url: p).clipShape(Circle()).accessibilityHidden(true) } else { Image(systemName: "person.fill").accessibilityHidden(true).font(.system(size: BP.px(30))).foregroundStyle(BP.inkSubtle) }
+                                }
+                                .frame(width: BP.px(110), height: BP.px(110))
+                                Text(c.name).font(BP.sans(12, .semibold)).foregroundStyle(BP.ink).lineLimit(1)
+                                Text(T("%lld titles", c.titles) + (c.role.map { " · " + T($0) } ?? "")).font(BP.sans(10)).foregroundStyle(BP.inkSubtle).lineLimit(1)
+                            }
+                            .frame(width: BP.px(130))
+                        }
+                        .buttonStyle(BPTileStyle(radius: BP.px(55)))
+                    }
+                }
+                .padding(.horizontal, BP.gutter).padding(.vertical, BP.px(14))
+            }
+            .scrollClipDisabled()
+        }
+        .focusSection()
+    }
+
+    private func filterRow(_ heading: String, _ options: [(String, String)], active: String, trailing: String?, pick: @escaping (String) -> Void) -> some View {
+        HStack(spacing: BP.px(8)) {
+            Text(T(heading).uppercased()).font(BP.sans(11, .bold)).tracking(1.5).foregroundStyle(BP.inkSubtle).frame(width: BP.px(80), alignment: .leading)
+            ForEach(options, id: \.0) { o in
+                Button(T(o.1)) { pick(o.0) }.buttonStyle(BPActionStyle(primary: active == o.0)).bpSelected(active == o.0)
+                    .focused($chipFocus, equals: heading + ":" + o.0)
+            }
+            if let trailing { Text(trailing).font(BP.sans(12)).foregroundStyle(BP.inkSubtle).padding(.leading, BP.px(8)) }
+        }
+        .focusSection()
+    }
+}

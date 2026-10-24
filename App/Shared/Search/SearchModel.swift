@@ -1,0 +1,416 @@
+import Foundation
+import Combine
+
+/// The Search room's data: 180 ms debounce, then upstream's search fan-out through the engine,
+/// grouped into rows in the Big Picture order (use-bp-search.ts buildBpSearchSlots).
+@MainActor
+final class SearchModel: ObservableObject {
+    struct Results: Decodable {
+        struct TopMatch: Decodable { var kind: String; var meta: Meta; var overview: String?; var backdrop: String? }
+        struct Person: Decodable, Identifiable {
+            var tmdbId: Int?
+            var name: String
+            var profile: String?
+            var knownFor: String?
+            var id: String { "\(tmdbId ?? 0)-\(name)" }
+            private enum CodingKeys: String, CodingKey { case tmdbId = "id", name, profile, knownFor }
+        }
+        struct AnimeHit: Decodable { var name: String; var poster: String?; var background: String?; var malId: Int?; var kitsuId: Int?; var year: String?; var overview: String? }
+        struct LiveTvHit: Decodable, Identifiable { var channelId: String; var name: String; var logo: String?; var url: String; var group: String?; var playlistId: String; var playlistName: String; var id: String { channelId } }
+        struct AddonGroup: Decodable, Identifiable { var id: String; var name: String; var logo: String?; @LossyArray var metas: [Meta]; var state: String? }   // lossy
+        struct CharacterRef: Decodable { var anilistId: Int; var malId: Int?; var type: String; var name: String; var poster: String?; var background: String?; var year: String?; var overview: String?; var score: Double? }
+        struct Character: Decodable, Identifiable { var id: Int; var name: String; var image: String?; var anime: [CharacterRef] }
+        struct AddonHit: Decodable, Identifiable { var id: String; var name: String; var logo: String?; var transportUrl: String?; var blurb: String?; var installed: Bool }
+        /// tvdb-collections TvdbCollectionHit (use-collection-hits).
+        struct CollectionHit: Decodable, Identifiable { var id: Int; var name: String; var image: String?; var overview: String? }
+        var query: String
+        var topMatch: TopMatch?
+        var people: [Person]?
+        @LossyArray var movies: [Meta]
+        @LossyArray var series: [Meta]
+        var anime: [AnimeHit]?
+        var liveTv: [LiveTvHit]?
+        var addonGroups: [AddonGroup]?
+        var addonQueries: [AddonGroup]?
+        var characters: [Character]?
+        var addons: [AddonHit]?
+        var collections: [CollectionHit]?
+        var requestId: Int?
+        /// lib/search.ts searchAll: the keyed TMDB search got no answer (offline, TMDB down).
+        var tmdbUnavailable: Bool?
+    }
+
+    /// Only a real edit searches: the query line is a system TextField now, and a write
+    /// of the same text (the tvOS keyboard handing its text back as it closes) retired the search
+    /// in flight and ran the whole fan-out again ("Searching…", the late addon rows dropped).
+    @Published var query = "" {
+        didSet {
+            guard query != oldValue else { return }
+            schedule()
+        }
+    }
+    @Published private(set) var status: Status = .idle
+    @Published private(set) var rows: [BrowseRow] = []
+    @Published private(set) var channels: [Results.LiveTvHit] = []
+    @Published private(set) var topMatch: Meta?
+    @Published private(set) var people: [Results.Person] = []
+    @Published private(set) var addonHits: [Results.AddonHit] = []
+    @Published private(set) var collections: [Results.CollectionHit] = []
+    /// Addon slots announced "pending" that have not answered yet (use-bp-search addonsPending).
+    @Published private(set) var addonsPending: Set<String> = []
+    /// Addon slots that answered "failed" (bp-search failedCount).
+    @Published private(set) var addonsFailed: Set<String> = []
+    /// search-display-state tmdbUnavailable: the keyed TMDB search got no answer.
+    @Published private(set) var tmdbUnavailable = false
+    /// use-bp-search QueryLatch.promote (person-top-match matchPersonForQuery): the
+    /// query names the first person found, so People leads the rows instead of following Series.
+    @Published private(set) var promotePerson = false
+    /// The addon slots in the order the fan-out announced them (installed order).
+    private var addonOrder: [String] = []
+    /// bp-search-group: every addon slot the query announced, in installed order,
+    /// with the engine's own state ("pending" | "ok" | "empty" | "failed"). A pending slot holds its
+    /// place with quiet plates, a failed one says "Didn't answer" with Try again, an empty one
+    /// collapses (bpGroupRenders), so rows never jump as addons answer.
+    struct AddonSlot: Identifiable, Equatable { var id: String; var name: String; var logo: String?; var state: String }
+    @Published private(set) var addonSlots: [AddonSlot] = []
+
+    // MARK: kind chips (use-bp-search.ts BpSearchFilter, GROUP_ORDER, GROUP_LABEL)
+
+    /// use-bp-search BpSearchFilter minus "top" (never a chip), in GROUP_ORDER.
+    enum Filter: String, CaseIterable, Identifiable {
+        case all, movie, series, people, anime, livetv, collections, characters, addons
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .all: return "All"
+            case .movie: return "Movies"
+            case .series: return "Series"
+            case .people: return "People"
+            case .anime: return "Anime"
+            case .livetv: return "Live TV"
+            case .collections: return "Collections"
+            case .characters: return "Franchise"
+            case .addons: return "Addons"
+            }
+        }
+    }
+    struct Chip: Identifiable { var filter: Filter; var count: Int; var id: String { filter.rawValue } }
+
+    /// bp-search: the chosen chip belongs to one query; a new query starts back on All.
+    @Published var filter: Filter = .all
+    /// use-bp-search QueryLatch.groups: a chip is never withdrawn mid-query.
+    private var latched: Set<Filter> = []
+    private var latchedQuery = ""
+
+    /// Which chip a result row belongs to (use-bp-search buildBpSearchSlots `group`).
+    static func group(ofRow key: String) -> Filter {
+        if key == "movies" { return .movie }
+        if key == "series" { return .series }
+        if key == "anime" { return .anime }
+        if key.hasPrefix("character:") { return .characters }
+        return .addons
+    }
+
+    func shows(_ group: Filter) -> Bool { filter == .all || filter == group }
+
+    /// use-bp-search counts: bpSectionCount summed per group ("top" excluded).
+    func count(_ group: Filter) -> Int {
+        switch group {
+        case .all: return distinctCount(nil)
+        case .people: return people.count
+        case .livetv: return channels.count
+        case .collections: return collections.count
+        case .addons: return addonHits.count + rows.filter { Self.group(ofRow: $0.key) == .addons }.reduce(0) { $0 + $1.metas.count }
+        default: return rows.filter { Self.group(ofRow: $0.key) == group }.reduce(0) { $0 + $1.metas.count }
+        }
+    }
+
+    /// use-bp-search bpDistinctCount: distinct things found, not cells drawn. Title rows count
+    /// each meta id once across rows; every other kind counts its length. nil = every group.
+    func distinctCount(_ only: Filter?) -> Int {
+        var seen: Set<String> = []
+        var n = 0
+        let keep: (Filter) -> Bool = { g in only == nil || only == g }
+        if keep(.people) { n += people.count }
+        if keep(.livetv) { n += channels.count }
+        if keep(.collections) { n += collections.count }
+        if keep(.addons) { n += addonHits.count }
+        for row in rows where keep(Self.group(ofRow: row.key)) {
+            if row.key == "anime" { n += row.metas.count; continue }
+            for m in row.metas where seen.insert(m.id).inserted { n += 1 }
+        }
+        return n
+    }
+
+    /// use-bp-search chips: none until something counted; then All plus every group that has
+    /// counted anything this query (or is the active one), in GROUP_ORDER.
+    var chips: [Chip] {
+        guard status != .idle, !latched.isEmpty else { return [] }
+        var out = [Chip(filter: .all, count: distinctCount(nil))]
+        for g in Filter.allCases where g != .all && (latched.contains(g) || g == filter) {
+            out.append(Chip(filter: g, count: count(g)))
+        }
+        return out
+    }
+
+    /// Settled: the fixed sources returned and no addon slot is still pending.
+    var settled: Bool { status == .done && addonsPending.isEmpty }
+    var busy: Bool { status == .typing || status == .loading || (status == .done && !addonsPending.isEmpty) }
+    /// use-bp-search filterStale: a chip that outlived its results.
+    var filterStale: Bool { settled && filter != .all && count(filter) == 0 }
+
+    private func latchGroups() {
+        for g in Filter.allCases where g != .all && count(g) > 0 { latched.insert(g) }
+    }
+    /// search-context RECENT_KEY: the last eight queries that found something.
+    @Published private(set) var recent: [String] = Prefs.get([String].self, for: "harbor.search.recent") ?? []
+    /// bp-search idle "Suggested": posters from the hero feed while the field is empty.
+    @Published private(set) var suggestions: [Meta] = []
+    /// The Suggested read has answered: an empty field with nothing to suggest says so (bp-search showEmpty).
+    @Published private(set) var suggestionsLoaded = false
+
+    func loadSuggestions() async {
+        guard suggestions.isEmpty else { return }
+        defer { suggestionsLoaded = true }
+        // bp-search: the first 60 unique posters across the Home rows, in row order.
+        struct Build: Decodable { struct Row: Decodable { @LossyArray var metas: [Meta] }; @LossyArray var rows: [Row] }
+        let p = ProfilesStore.shared.active
+        let authKey = p.flatMap { ProfilesStore.shared.stremioSession(for: $0.id)?.authKey }
+        var metas: [Meta] = []
+        if let b: Build = try? await HarborEngine.shared.call("rooms.homeFor", [p?.id ?? "default", p?.linked ?? true, authKey]) { metas = b.rows.flatMap(\.metas) }
+        if metas.isEmpty { metas = (try? await HarborEngine.shared.call("feed.hero", ["trending"])) ?? [] }
+        var seen: Set<String> = []
+        suggestions = metas.filter { $0.poster != nil && seen.insert($0.id).inserted }.prefix(60).map { $0 }
+        await CardMarksStore.shared.refresh(suggestions)
+    }
+
+    /// search-context recordRecent: only when the viewer commits (opens a result), never mid-typing;
+    /// magnets and direct video links are never kept.
+    func commitRecent() {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        // isMagnetInput / isDirectVideoUrl: magnets, bare infohashes and links never become recents.
+        guard q.count >= 2, !q.lowercased().hasPrefix("magnet:"), q.range(of: #"^https?://"#, options: [.regularExpression, .caseInsensitive]) == nil,
+              q.range(of: #"^([0-9a-fA-F]{40}|[A-Za-z2-7]{32})$"#, options: .regularExpression) == nil else { return }
+        noteRecent(q)
+    }
+
+    private func noteRecent(_ q: String) {
+        var list = recent.filter { $0.caseInsensitiveCompare(q) != .orderedSame }
+        list.insert(q, at: 0)
+        recent = Array(list.prefix(8))
+        try? Prefs.set(recent, for: "harbor.search.recent")
+    }
+
+    func clearRecent() { recent = []; try? Prefs.set([String](), for: "harbor.search.recent") }
+
+    /// search-context removeRecent: one query off the list (held Select on its chip).
+    func removeRecent(_ q: String) {
+        recent = recent.filter { $0 != q }
+        try? Prefs.set(recent, for: "harbor.search.recent")
+    }
+
+    /// components/search/person-top-match.tsx matchPersonForQuery: the first person,
+    /// with a photo, whose name is the query, starts with it, or is how it starts (3+ characters).
+    static func matchesPerson(_ people: [Results.Person], _ query: String) -> Bool {
+        guard let p = people.first, let profile = p.profile, !profile.isEmpty else { return false }
+        let norm: (String) -> String = { s in
+            s.lowercased().replacingOccurrences(of: "[^a-z0-9]+", with: " ", options: .regularExpression).trimmingCharacters(in: .whitespaces)
+        }
+        let q = norm(query)
+        let n = norm(p.name)
+        guard q.count >= 3, !n.isEmpty else { return false }
+        return n == q || n.hasPrefix(q) || q.hasPrefix(n)
+    }
+
+    /// After an install from "Addons you could install", the hit shows its tick straight away.
+    func markInstalled(_ id: String) {
+        for i in addonHits.indices where addonHits[i].id == id { addonHits[i].installed = true }
+    }
+    private var engineRequestId = 0
+    /// Addon slots of the current fan-out that answered (upsert) before run()
+    /// built its rows: run() keeps that answer rather than the fan-out's pending (or held) slot.
+    private var answeredSince: Set<String> = []
+    private var unsubscribe: (() -> Void)?
+    /// Addon answers that crossed before this side learned the request id they belong to.
+    private var early: [(Int, Results.AddonGroup)] = []
+
+    init() {
+        // Slow addons answer after the fan-out returned; each answer replaces its own row in place.
+        unsubscribe = HarborEngine.shared.onEvent { [weak self] type, detail in
+            guard type == "harbor:search-addon-group", let self, let detail,
+                  let group = try? detail["group"]?.decode(Results.AddonGroup.self) else { return }
+            let rid = Int(detail["requestId"]?.number ?? -1)
+            if rid == self.engineRequestId { self.upsert(group) }
+            else if rid > self.engineRequestId, self.status == .loading { self.early = Array((self.early + [(rid, group)]).suffix(64)) }
+        }
+    }
+    deinit { unsubscribe?() }
+
+    private func upsert(_ g: Results.AddonGroup) {
+        let key = "addon:\(g.id)"
+        var out = rows.filter { $0.key != key }
+        if !g.metas.isEmpty {
+            // use-bp-search addon slot label: the addon's own name (bp-search-group heads it with the mark).
+            let row = BrowseRow(key: key, title: g.name, metas: g.metas)
+            // use-bp-search: addon slots keep the order the fan-out announced
+            // (installed order). A late answer went in ahead of every addon row already up, so the
+            // addon rows reshuffled by answer speed on each query.
+            let order = addonOrder
+            let rank: Int = order.firstIndex(of: g.id) ?? Int.max
+            let at: Int? = out.firstIndex { r in
+                guard r.key.hasPrefix("addon:") else { return false }
+                let id = String(r.key.dropFirst("addon:".count))
+                let other: Int = order.firstIndex(of: id) ?? Int.max
+                return other > rank
+            }
+            if let at { out.insert(row, at: at) } else { out.append(row) }
+        }
+        rows = out
+        answeredSince.insert(g.id)
+        addonsPending.remove(g.id)
+        if g.state == "failed" { addonsFailed.insert(g.id) } else { addonsFailed.remove(g.id) }
+        let state: String = g.state ?? (g.metas.isEmpty ? "empty" : "ok")
+        if let at = addonSlots.firstIndex(where: { $0.id == g.id }) {
+            addonSlots[at].state = state
+        } else {
+            addonSlots.append(AddonSlot(id: g.id, name: g.name, logo: g.logo, state: state))
+        }
+        latchGroups()
+        Task { await CardMarksStore.shared.refresh(g.metas) }
+    }
+
+    enum Status: Equatable { case idle, typing, loading, done, failed(String) }
+
+    /// search-context retry (bp-search onRetry / the empty state's Try again):
+    /// the same query is asked again from the top (search-context bumps retryNonce, which re-runs the
+    /// whole fan-out); its rows stay up until the answer replaces them. An addon
+    /// slot that had already answered keeps its row (or its collapse) while it is asked again, and
+    /// only its new answer replaces it; before, every answered addon row dropped back to pending
+    /// plates until that addon answered a second time.
+    func retry() {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty, status != .loading else { return }
+        timer?.cancel()
+        requestId += 1
+        timer = Task { [weak self] in
+            await self?.run(q, holdAnswered: true)
+        }
+    }
+
+    private var timer: Task<Void, Never>?
+    private var requestId = 0
+
+    private func schedule() {
+        timer?.cancel()
+        // Any edit retires the run in flight: it re-checks this after each await, so a
+        // cleared field (or a newer query) never gets the old query's people / top match / status.
+        requestId += 1
+        let q = query.trimmingCharacters(in: .whitespaces)
+        // search-display-state getSearchDisplayState: results only ever show under the query that
+        // asked for them. The last query's rows, people and top match stayed up (and could be
+        // opened, filing the new query as a recent) until the new fan-out answered, or for good
+        // when it failed.
+        if q != latchedQuery {
+            latchedQuery = q; latched = []; filter = .all; engineRequestId = 0; addonsPending = []
+            rows = []; channels = []; topMatch = nil; addonHits = []; collections = []; people = []; early = []
+            addonsFailed = []; addonOrder = []; addonSlots = []; tmdbUnavailable = false; promotePerson = false
+        }
+        guard !q.isEmpty else {
+            status = .idle; rows = []; channels = []; topMatch = nil; addonHits = []; collections = []; addonsPending = []; people = []; early = []; engineRequestId = 0
+            addonsFailed = []; addonOrder = []; addonSlots = []; tmdbUnavailable = false; promotePerson = false
+            return
+        }
+        status = .typing
+        timer = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            await self?.run(q)
+        }
+    }
+
+    private func run(_ q: String, holdAnswered: Bool = false) async {
+        requestId += 1
+        let mine = requestId
+        status = .loading
+        do {
+            // search-context.tsx fan-out in the engine: TMDB (when keyed), anime, addon catalogs fused
+            // into Movies/Series, Cinemeta, Live TV channels, franchise characters, addon index.
+            let p = ProfilesStore.shared.active
+            let authKey = p.flatMap { ProfilesStore.shared.stremioSession(for: $0.id)?.authKey }
+            let results: Results
+            if Self.usesFixtures {
+                // `--fixtures shell` on the simulator: fake answers, no engine (SearchFixtures.swift).
+                results = try Self.fixtureResults(q)
+            } else {
+                results = try await HarborEngine.shared.call("search.fanOut", [q, p?.id ?? "default", p?.linked ?? true, authKey])
+            }
+            guard mine == requestId else { return }
+            engineRequestId = results.requestId ?? 0
+            answeredSince = []
+            addonsPending = Set((results.addonQueries ?? []).filter { $0.state == "pending" }.map(\.id))
+            addonsFailed = Set((results.addonQueries ?? []).filter { $0.state == "failed" }.map(\.id))
+            addonOrder = (results.addonQueries ?? results.addonGroups ?? []).map(\.id)
+            // On a retry, a slot the last answer settled ("ok" / "empty") that the
+            // new fan-out announces pending keeps its settled state and row until upsert brings
+            // the new answer; failed slots go to pending plates as before.
+            let priorSlots: [AddonSlot] = holdAnswered ? addonSlots : []
+            let priorRows: [BrowseRow] = holdAnswered ? rows.filter { $0.key.hasPrefix("addon:") } : []
+            var held: Set<String> = []
+            addonSlots = (results.addonQueries ?? []).map { q in
+                let state: String = q.state ?? (q.metas.isEmpty ? "empty" : "ok")
+                var slot = AddonSlot(id: q.id, name: q.name, logo: q.logo, state: state)
+                if state == "pending", let old = priorSlots.first(where: { $0.id == q.id }), old.state == "ok" || old.state == "empty" {
+                    held.insert(q.id)
+                    slot.state = old.state
+                }
+                return slot
+            }
+            tmdbUnavailable = results.tmdbUnavailable ?? false
+            var out: [BrowseRow] = []
+            if !results.movies.isEmpty { out.append(BrowseRow(key: "movies", title: T("Movies"), metas: results.movies)) }
+            if !results.series.isEmpty { out.append(BrowseRow(key: "series", title: T("Series"), metas: results.series)) }
+            if let anime = results.anime, !anime.isEmpty {
+                let metas = anime.map { Meta(id: $0.kitsuId.map { "kitsu:\($0)" } ?? "mal:\($0.malId ?? 0)", type: "anime", name: $0.name, poster: $0.poster, background: $0.background, logo: nil, description: $0.overview, releaseInfo: $0.year, releaseDate: nil, inTheaters: nil, imdbRating: nil, tmdbScore: nil, runtime: nil, genres: nil, adult: nil, isCollection: nil, providerBadge: nil, videos: nil) }
+                out.append(BrowseRow(key: "anime", title: T("Anime"), metas: metas))
+            }
+            // use-bp-search: one franchise row per character hit (AniList), its titles as anime metas.
+            for c in results.characters ?? [] where !c.anime.isEmpty {
+                let metas = c.anime.map { r in Meta(id: "anilist:\(r.anilistId)", type: "anime", name: r.name, poster: r.poster, background: r.background ?? r.poster, logo: nil, description: r.overview, releaseInfo: r.year, releaseDate: nil, inTheaters: nil, imdbRating: (r.score ?? 0) > 0 ? String(format: "%.1f", r.score ?? 0) : nil, tmdbScore: nil, runtime: nil, genres: nil, adult: nil, isCollection: nil, providerBadge: nil, videos: nil) }
+                out.append(BrowseRow(key: "character:\(c.id)", title: c.name, metas: metas))
+            }
+            // bp-search-rows: one row per addon that answered ("From <addon>"), after the catalogs.
+            // addonQueries keeps every slot's own hits (never stripped against the fused rows).
+            for g in results.addonQueries ?? results.addonGroups ?? [] {
+                if answeredSince.contains(g.id) {
+                    // Answered (upsert) since the fan-out came back: that answer is the row.
+                    if let now = rows.first(where: { $0.key == "addon:\(g.id)" }) { out.append(now) }
+                } else if held.contains(g.id) {
+                    if let old = priorRows.first(where: { $0.key == "addon:\(g.id)" }) { out.append(old) }
+                } else if !g.metas.isEmpty {
+                    out.append(BrowseRow(key: "addon:\(g.id)", title: g.name, metas: g.metas))
+                }
+            }
+            addonHits = results.addons ?? []
+            collections = results.collections ?? []
+            rows = out
+            channels = results.liveTv ?? []
+            // With the rows, not after the marks read: People and Top match landing a beat later
+            // pushed rows already on screen down under the ring (use-bp-search latch.decided).
+            people = results.people ?? []
+            promotePerson = Self.matchesPerson(results.people ?? [], q)
+            // use-bp-search slot "top": search-context's topMatch (TMDB's best hit)
+            // and nothing else. The first Movies or Series tile stood in when TMDB named none.
+            topMatch = results.topMatch?.meta
+            await CardMarksStore.shared.refresh(out.flatMap(\.metas))
+            guard mine == requestId else { return }
+            status = .done
+            latchGroups()
+            let late = early.filter { $0.0 == engineRequestId }.map { $0.1 }
+            early = []
+            for g in late { upsert(g) }
+        } catch {
+            guard mine == requestId else { return }
+            status = .failed(error.localizedDescription)
+        }
+    }
+}

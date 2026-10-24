@@ -1,0 +1,262 @@
+import SwiftUI
+
+/// Poster (2:3), wide (16:9) and rank (numeral + poster) tiles, bp-tile.tsx geometry at the TV canvas.
+struct BPTileView: View {
+    let meta: Meta
+    let shape: TileShape
+    var rank: Int? = nil
+    var focused = false
+    @ObservedObject private var marks = CardMarksStore.shared
+    /// poster.tsx sizes the art to the card at devicePixelRatio (PosterSizing).
+    @Environment(\.displayScale) private var displayScale
+    /// Off under a spotlight hero (BPRailView), which already names the focused
+    /// title in large type: the caption over the poster art only repeated it, over the poster's own
+    /// lettering. Grids without a hero (Search, Library, See all) keep it.
+    @Environment(\.bpTileCaptions) private var tileCaptions
+    /// The art url that drew nothing (its fallback too). bp-tile's art.url goes
+    /// empty once useBpArt's chain runs out, and the title stands on the plate again; kept as the
+    /// url rather than a flag so a reused tile with other art is not held to an old failure.
+    @State private var deadArt: String?
+
+    /// bp-tile's 177 px canvas poster made a 298×447 pt card: a
+    /// parked poster row then ran from under the hero into the hint bar, and only five and a half
+    /// fit across. 150 px (253×379 pt) keeps a full row, its caption and the next header on screen,
+    /// close to the Apple TV app's own poster shelves, and clear of tvOS's focus-scroll margin.
+    static let posterWidth = BP.px(150)
+    static let wideWidth = BP.px(230)
+    static var posterSize: CGSize { CGSize(width: posterWidth, height: (posterWidth * 1.5).rounded()) }
+    static var wideSize: CGSize { CGSize(width: wideWidth, height: (wideWidth * 9 / 16).rounded()) }
+    /// Rank cell: poster covers the right 60% of the cell
+    /// width, cell aspect 10:9 (bp-tile.tsx RANK_CELL_RATIO). bp-tile.tsx's own comment: "0.6 of
+    /// the width at 2/3 is 0.9, so the cell ends exactly where the poster does and a ranked row
+    /// keeps the same height as its neighbours in the rail" — i.e. height = cellWidth × 0.9 =
+    /// (posterWidth / 0.6) × 0.9 = posterWidth × 1.5, which is exactly `posterSize.height`. This
+    /// used to multiply by an extra × 0.9 on top of that (posterWidth × 1.5 × 0.9), making a "Top
+    /// 10" row ~10% shorter than its poster-shaped neighbours (a 10:8.1 cell, not 10:9) — the rank
+    /// row and the numbered tile's numeral both undersized, and misaligned against the rest of the
+    /// rail.
+    static var rankSize: CGSize { CGSize(width: (posterWidth / 0.6).rounded(), height: posterSize.height) }
+    /// bp-service-row.tsx: clamp(150px, 12.4vw, 244px) wide, 1.2:1.
+    static var brandSize: CGSize { CGSize(width: BP.px(238), height: (BP.px(238) / 1.2).rounded()) }
+    /// bp-collections-row.tsx CELL_WIDTH clamp(230px, 19vw, 340px) at the 1140 canvas, 16:9.
+    static var collectionSize: CGSize { CGSize(width: BP.px(230), height: (BP.px(230) * 9 / 16).rounded()) }
+
+    var body: some View {
+        // bp-tile.tsx aria-label={meta.name}: one name for the whole tile. The poster's caption is
+        // invisible until focus, the rank tile has only its numeral, and the mark chips are extras.
+        face
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(verbatim: meta.name))
+            // The mark chips it ignores: pick-card.tsx aria-label t("In watchlist"), and the watched check.
+            .accessibilityValue(Text(verbatim: markText))
+    }
+
+    private var markText: String {
+        let m = marks.byId[meta.id]
+        let parts: [String] = [m?.watched != nil ? T("Watched") : "", m?.bookmark != nil ? T("In watchlist") : ""]
+        return parts.filter { !$0.isEmpty }.joined(separator: ", ")
+    }
+
+    /// The same marks for a caller that sets the tile button's own value (Library's
+    /// resume bar): a value set on the button replaced the tile's, so the marks went unread there.
+    @MainActor static func markValue(_ id: String) -> String {
+        let m = CardMarksStore.shared.byId[id]
+        let parts: [String] = [m?.watched != nil ? T("Watched") : "", m?.bookmark != nil ? T("In watchlist") : ""]
+        return parts.filter { !$0.isEmpty }.joined(separator: ", ")
+    }
+
+    @ViewBuilder private var face: some View {
+        switch shape {
+        case .poster: poster
+        case .wide: wide
+        case .rank: rankCell
+        case .brand: brandTile
+        case .collection: collectionCard
+        }
+    }
+
+    /// bp-tile.tsx: "Big Picture prints the title inside the art". The caption used to
+    /// hang under the poster, so the focus ring framed an extra caption strip, and a row parked
+    /// under the hero put that caption under the hint bar (use-bp-rail's floor is the art's edge).
+    private var poster: some View {
+        art(url: meta.poster ?? meta.background, size: Self.posterSize, caption: true, chain: true)
+    }
+
+    private var wide: some View {
+        ZStack(alignment: .bottomLeading) {
+            art(url: meta.background ?? meta.poster, size: Self.wideSize, plateText: false)
+            LinearGradient(colors: [.clear, BP.void_.opacity(0.85)], startPoint: .center, endPoint: .bottom)
+            Text(meta.name).font(BP.sans(14, .semibold)).foregroundStyle(BP.ink).lineLimit(1).padding(BP.px(10))
+        }
+        .frame(width: Self.wideSize.width, height: Self.wideSize.height)
+        .clipShape(RoundedRectangle(cornerRadius: BP.rXS, style: .continuous))
+    }
+
+    private var rankCell: some View {
+        HStack(alignment: .bottom, spacing: 0) {
+            Text("\(rank ?? 0)")
+                .font(.custom("Switzer-Bold", size: Self.rankSize.height * 0.9))
+                .foregroundStyle(BP.ink.opacity(focused ? 0.85 : 0.45))
+                .frame(width: Self.rankSize.width * 0.4, alignment: .trailing)
+                .offset(x: BP.px(6), y: Self.rankSize.height * 0.18)
+                .clipped()
+            // (open-items sweep 3) bp-tile.tsx: the ranked cell's card is the same button as a poster
+            // tile's, scrim and title (data-bp-tile-title) on focus included; it drew neither.
+            // The rank numeral already says Top 10: the ribbon on top of it made
+            // three labels on one card (numeral, NEW, TOP 10).
+            art(url: meta.poster ?? meta.background, size: CGSize(width: Self.rankSize.width * 0.6, height: Self.rankSize.height), caption: true, chain: true, ribbon: false)
+                .modifier(BPTileFocusModifier(focused: focused, pressed: false))
+                .zIndex(1)
+        }
+        .frame(width: Self.rankSize.width, height: Self.rankSize.height, alignment: .bottomTrailing)
+    }
+
+    /// Streaming-service tile: the brand tint over the panel (62 %, 18 % for white marks), the
+    /// name as the mark (the SVG logos are not bundled), a light sheen from the top.
+    private var brandTile: some View {
+        let tint = Color(css: meta.providerBadge?.tint ?? "") ?? BP.ink
+        let white = (meta.providerBadge?.tint ?? "").uppercased() == "#FFFFFF"
+        return ZStack {
+            RoundedRectangle(cornerRadius: BP.rSM, style: .continuous).fill(BP.panel)
+            RoundedRectangle(cornerRadius: BP.rSM, style: .continuous).fill(tint.opacity(white ? 0.18 : (focused ? 0.8 : 0.62)))
+            LinearGradient(colors: [BP.ink.opacity(0.12), .clear, BP.void_.opacity(0.55)], startPoint: .top, endPoint: .bottom)
+                .clipShape(RoundedRectangle(cornerRadius: BP.rSM, style: .continuous))
+            if let logo = meta.providerBadge?.logo, !logo.isEmpty {
+                // bp-addon-card: the addon's own logo over its name.
+                VStack(spacing: BP.px(8)) {
+                    // A logo that fails (OpenSubtitles) left an empty grey square:
+                    // the addon glyph stands in.
+                    ZStack {
+                        if deadArt == logo {
+                            Image(systemName: "puzzlepiece.extension.fill").font(.system(size: BP.px(26), weight: .medium)).foregroundStyle(BP.inkMuted)
+                                .accessibilityHidden(true)
+                        } else {
+                            RemoteImage(url: logo, contentMode: .fit, onResult: { shown, ok in
+                                if !ok { deadArt = shown } else if deadArt == shown { deadArt = nil }
+                            })
+                        }
+                    }
+                    .frame(width: BP.px(56), height: BP.px(56)).clipShape(RoundedRectangle(cornerRadius: BP.px(12)))
+                    Text(meta.name).font(BP.sans(14, .semibold)).foregroundStyle(BP.ink).lineLimit(1).padding(.horizontal, BP.px(10))
+                }
+            } else {
+                Text(meta.name).font(BP.display(22, .semibold)).foregroundStyle(BP.ink).lineLimit(2).multilineTextAlignment(.center).padding(BP.px(12))
+            }
+        }
+        .frame(width: Self.brandSize.width, height: Self.brandSize.height)
+    }
+
+    /// bp-collection-card.tsx BpCollectionCard: the backdrop at 85 % on the panel under the bottom
+    /// scrim, the meta line ("{count} films", uppercase) over the name (two lines). The line rides
+    /// in `description` (EngineBrowseSource builds these tiles).
+    private var collectionCard: some View {
+        ZStack(alignment: .bottomLeading) {
+            RoundedRectangle(cornerRadius: BP.rMD, style: .continuous).fill(BP.panel)
+            if let bg = meta.background, !bg.isEmpty { RemoteImage(url: bg).opacity(0.85) }
+            LinearGradient(stops: [.init(color: BP.void_.opacity(0.92), location: 0), .init(color: BP.void_.opacity(0.44), location: 0.54),
+                                   .init(color: .clear, location: 1)], startPoint: .bottom, endPoint: .top)
+            VStack(alignment: .leading, spacing: BP.px(4)) {
+                Text(meta.description ?? T("Collection"))
+                    .font(BP.sans(12, .bold)).textCase(.uppercase).tracking(BP.px(1.2)).foregroundStyle(BP.inkSubtle).lineLimit(1)
+                Text(meta.name).font(BP.sans(12.5, .semibold)).foregroundStyle(BP.ink).lineLimit(2).multilineTextAlignment(.leading)
+            }
+            .padding(BP.px(10))
+        }
+        .frame(width: Self.collectionSize.width, height: Self.collectionSize.height)
+        .clipShape(RoundedRectangle(cornerRadius: BP.rMD, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: BP.rMD, style: .continuous).stroke(BP.edge, lineWidth: 1))
+    }
+
+    private func art(url: String?, size: CGSize, plateText: Bool = true, caption: Bool = false, chain: Bool = false, ribbon: Bool = true) -> some View {
+        // The settings slice read once: each read of `slice` copies the whole
+        // ~140-field struct out of its @Published wrapper, and this runs for every tile on each redraw.
+        let settings: SettingsBridge.Slice = SettingsBridge.shared.slice
+        // bp-tile.tsx showTitle = !settings.hidePosterTitles: no title on the plate or under the ring.
+        let showTitle: Bool = settings.hidePosterTitles != true
+        // components/poster.tsx: the art is asked for at the card's size × posterQuality.
+        let sized: String? = PosterSizing.sized(url, width: max(size.width, size.height * 2 / 3), scale: displayScale,
+                                                quality: settings.posterQuality)
+        // bp-poster-chain useBpPosterChain: a poster-shaped tile asks the viewer's
+        // poster service first (never resized), and falls back to the sized poster when it fails.
+        let override: String? = chain ? PosterChain.override(for: meta) : nil
+        // bp-tile.tsx: the title sits on the plate only while art.url is empty, and art.url is the
+        // override when there is one (useBpArt pickArt), so an RPDB poster over a meta with no art
+        // of its own is art like any other; the plate text comes back once nothing can draw.
+        let candidate: String? = override ?? sized
+        let drawn: String? = candidate?.isEmpty == false ? candidate : nil
+        let hasArt: Bool = drawn != nil && drawn != deadArt
+        return ZStack(alignment: .topLeading) {
+            RemoteImage(url: drawn, fallback: override == nil ? nil : sized, onResult: { shown, ok in
+                if !ok { deadArt = shown } else if deadArt == shown { deadArt = nil }
+            })
+            // Art wider than the tile (Cyberpunk: Edgerunners) filled past it and
+            // widened the stack, so the marks overlay sat off the card and the NEW chip was cut.
+            .frame(width: size.width, height: size.height).clipped()
+            if !hasArt && plateText && showTitle {
+                Text(meta.name).font(BP.sans(12, .semibold)).foregroundStyle(BP.inkMuted)
+                    .multilineTextAlignment(.center).padding(BP.px(10))
+                    .frame(width: size.width, height: size.height)
+            }
+            if caption && hasArt && tileCaptions {
+                // bp-tile.tsx: --bp-scrim-up over the lower half, then the title (line-clamp-2,
+                // px-2.5 pb-2), both only on focus; the marks draw after them, unwashed.
+                LinearGradient(stops: [.init(color: BP.void_, location: 0), .init(color: BP.void_.opacity(0.88), location: 0.18),
+                                       .init(color: BP.void_.opacity(0.62), location: 0.34), .init(color: BP.void_.opacity(0.3), location: 0.52),
+                                       .init(color: BP.void_.opacity(0.1), location: 0.68), .init(color: .clear, location: 0.82)],
+                               startPoint: .bottom, endPoint: .top)
+                    .frame(width: size.width, height: size.height / 2)
+                    .frame(width: size.width, height: size.height, alignment: .bottom)
+                    .opacity(focused ? 1 : 0)
+                    .animation(.easeOut(duration: 0.26), value: focused)
+                if showTitle {
+                    Text(meta.name)
+                        .font(BP.sans(10.5, .semibold)).foregroundStyle(BP.ink).lineLimit(2).multilineTextAlignment(.leading)
+                        .padding(.horizontal, BP.px(10)).padding(.bottom, BP.px(8))
+                        .frame(width: size.width, height: size.height, alignment: .bottomLeading)
+                        .opacity(focused ? 1 : 0)
+                        .animation(.easeOut(duration: 0.26), value: focused)
+                }
+            }
+            CardMarksOverlay(marks: marks.byId[meta.id], fallbackChip: marks.byId[meta.id] == nil ? CardMark.identity(for: meta) : nil, size: size, ribbon: ribbon)
+        }
+        .frame(width: size.width, height: size.height)
+        .clipShape(RoundedRectangle(cornerRadius: BP.rXS, style: .continuous))
+    }
+}
+
+
+/// bp-card-marks.tsx top-start identity chip, the parts that need no extra data:
+/// New (released this year) → Rerun (in cinema but >9 months old) → In Cinema.
+/// Award and DUB chips join with the awards catalog and anime detection.
+enum CardMark {
+    static func identity(for meta: Meta) -> String? {
+        let year = Calendar.current.component(.year, from: Date())
+        let inCinema = meta.type == "movie" && meta.inTheaters == true
+        if !inCinema, meta.releaseInfo == String(year) { return T("New") }
+        if inCinema {
+            if let d = meta.releaseDate, let released = Self.isoFormatter.date(from: d) ?? Self.dayFormatter.date(from: d),
+               Date().timeIntervalSince(released) / (60 * 60 * 24 * 30.44) > 9 {
+                return meta.releaseInfo.map { T("Rerun") + " · \($0)" } ?? T("Rerun")
+            }
+            return T("In Cinema")
+        }
+        return nil
+    }
+
+    /// Made once: this runs in every tile's body (the fallback chip before the engine's
+    /// marks land), and a formatter per in-cinema tile per redraw is expensive on an Apple TV HD.
+    private static let isoFormatter = ISO8601DateFormatter()
+
+    private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX"); return f
+    }()
+}
+
+private struct BPTileCaptionsKey: EnvironmentKey { static let defaultValue = true }
+extension EnvironmentValues {
+    /// Whether a focused poster prints its title over its art (BPTileView).
+    var bpTileCaptions: Bool {
+        get { self[BPTileCaptionsKey.self] }
+        set { self[BPTileCaptionsKey.self] = newValue }
+    }
+}

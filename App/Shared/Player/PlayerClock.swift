@@ -1,0 +1,48 @@
+import SwiftUI
+
+/// PlayerScreen's playback clock: the 1 s tick's snapshot (position, duration, pause
+/// flag) and the buffered end. The screen holds it in a plain @State (not @StateObject), so its
+/// body is not redrawn when the clock moves; only the leaves that show time observe it
+/// (PlayerClockReader, PlayerSeekValue). Logic in the screen reads `snap` straight from here, and
+/// a read is always the newest value. A tick publishes only what changed, so a paused video
+/// redraws nothing.
+final class PlayerClock: ObservableObject {
+    @Published private(set) var snap: (position: Double, duration: Double, paused: Bool) = (0, 0, false)
+    /// bp-player-scrub: demuxer cache end, drawn as the buffered fill.
+    @Published private(set) var buffered: Double = 0
+    /// The last spot the picture reached (duration and position both known), for Switch source.
+    /// Not published: nothing draws it.
+    var lastGoodPos: Double = 0
+
+    /// A snapshot from the engine: stored (and published) only when it differs.
+    func update(_ s: (position: Double, duration: Double, paused: Bool)) {
+        if s.duration > 0, s.position > 0 { lastGoodPos = s.position }
+        let same: Bool = s.position == snap.position && s.duration == snap.duration && s.paused == snap.paused
+        if !same { snap = s }
+    }
+
+    /// A seek the player just asked for: the readout moves there before the next tick.
+    func seeked(to position: Double) {
+        if snap.position != position { snap.position = position }
+    }
+
+    func updateBuffered(_ sec: Double) {
+        if sec != buffered { buffered = sec }
+    }
+
+    /// A stream swap (PlayerSession.switchStream): nothing else clears `snap`, so it kept the left
+    /// file's own numbers until the new controller's first tick, up to 1 s away (this clock's own
+    /// tick rate). Upstream reads the video element's own `duration`, which the browser already
+    /// resets on a `src` swap; this gives the TV's copy of it the same shape. `lastGoodPos` (kept,
+    /// for Switch source) still answers "where were we" while this reads 0.
+    func resetForSwap() {
+        if snap.position != 0 || snap.duration != 0 { snap = (0, 0, snap.paused) }
+    }
+
+    /// bp-player-scrub.tsx fmtTime: m:ss, or h:mm:ss from an hour.
+    static func fmt(_ s: Double) -> String {
+        guard s.isFinite, s > 0 else { return "0:00" }
+        let t = clampedInt(s)
+        return t >= 3600 ? String(format: "%d:%02d:%02d", t / 3600, (t / 60) % 60, t % 60) : String(format: "%d:%02d", t / 60, t % 60)
+    }
+}

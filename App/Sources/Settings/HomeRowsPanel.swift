@@ -1,0 +1,228 @@
+import SwiftUI
+
+/// Settings → Home rows: settings.homeRows through lib/home-customization (engine/homeExtras.ts).
+/// Upstream's Big Picture has no customize page (use-bp-row-layout.ts takes the desktop's layout
+/// through sync); the TV edits the same object: reorder, hide, rename, Top 10 numerals, custom
+/// lists as Home rows (homeRows.listRows) and the Simkl home rail switches. Home re-reads on
+/// `harbor:home-updated`, which every change raises.
+struct HomeRowsPanel: View {
+    struct RowsState: Decodable {
+        struct Row: Decodable, Identifiable { var key: String; var name: String; var originalName: String; var hidden: Bool; var numerals: Bool; var id: String { key } }
+        struct ListEntry: Decodable, Identifiable { var id: String; var name: String; var count: Int; var onHome: Bool }
+        struct Simkl: Decodable { var connected: Bool; var home: Bool; var upNext: Bool; var trending: Bool }
+        struct Cw: Decodable { var advanceNext: Bool; var hideCaughtUp: Bool; var animeCwEnd: String }
+        var rows: [Row]
+        var lists: [ListEntry]
+        var simkl: Simkl
+        var cw: Cw?
+    }
+    @State private var layout: RowsState?
+    @State private var renaming: RowsState.Row?
+    @State private var newName = ""
+    @FocusState private var focus: String?
+    /// A layout synced from another device (profile sync's `home` section is
+    /// settings.homeRows) or a Simkl / Continue Watching switch changed elsewhere: the panel read its
+    /// state once per visit and kept showing, and editing, the old one.
+    @StateObject private var watch = SettingsFieldWatch { f in
+        f == "homeRows" || f == "animeCwEnd" || f.hasPrefix("simkl") || f.hasPrefix("cw")
+    }
+
+    private func startRename(_ r: RowsState.Row) {
+        renaming = r
+        newName = r.name
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { focus = "rename-save" }
+    }
+
+    /// The editor closes under the ring: it goes back to that row's Rename. Not when a
+    /// sync already closed this editor (its row went away while Save / Reset waited on the engine).
+    private func endRename(_ key: String) {
+        guard renaming?.key == key else { return }
+        renaming = nil
+        focus = "rename:\(key)"
+    }
+
+    /// Every new state goes through here: a sync (SettingsFieldWatch re-read) that removed
+    /// the row being renamed closed nothing, and the editor's close aimed the ring at a Rename that
+    /// no longer exists. The editor closes, and a ring on its buttons goes to the Rename of the row
+    /// now in the removed one's place (the one above at the end; nowhere named when no row is left).
+    private func apply(_ next: RowsState) {
+        let before = layout?.rows ?? []
+        layout = next
+        guard let r = renaming, !next.rows.contains(where: { $0.key == r.key }) else { return }
+        renaming = nil
+        // Only a ring on one of the editor's buttons is moved; one on the field (untagged, as is
+        // the rest of the panel) is left to tvOS, which finds the nearest button that exists.
+        let inEditor = focus == "rename-save" || focus == "rename-reset" || focus == "rename-cancel"
+        guard inEditor else { return }
+        let was = before.firstIndex(where: { $0.key == r.key }) ?? 0
+        if next.rows.isEmpty {
+            focus = nil
+        } else {
+            focus = "rename:\(next.rows[min(was, next.rows.count - 1)].key)"
+        }
+    }
+
+    /// Menu while the rename editor is open closes it; nil otherwise, so Menu still leaves Settings.
+    private var exitAction: (() -> Void)? {
+        guard let r = renaming else { return nil }
+        return { endRename(r.key) }
+    }
+
+    private var profile: (id: String, linked: Bool) { let p = ProfilesStore.shared.active; return (p?.id ?? "default", p?.linked ?? true) }
+
+    /// "Clear Continue Watching": every row item dismissed as the
+    /// quick panel's Remove does one, on this TV and in the Stremio library (engine
+    /// rooms.clearContinueWatching), plus this TV's saved resume frames. Asks once before it runs.
+    @State private var clearAsk = false
+    @State private var clearing = false
+    @State private var clearedCount: Int?
+
+    @ViewBuilder private var clearCwControls: some View {
+        HStack(spacing: BP.px(8)) {
+            if clearAsk {
+                Text(T("Clear everything you're watching, here and in your Stremio library?")).font(BP.sans(14)).foregroundStyle(BP.ink).lineLimit(2)
+                Button(T("Clear")) { Task { await clearCw() } }
+                    .buttonStyle(BPActionStyle(primary: true, busy: clearing))
+                    .focused($focus, equals: "cw-clear-yes")
+                Button(T("Cancel")) {
+                    clearAsk = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { focus = "cw-clear" }
+                }
+                    .buttonStyle(BPActionStyle())
+            } else {
+                Button(T("Clear Continue Watching")) {
+                    clearedCount = nil
+                    clearAsk = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { focus = "cw-clear-yes" }
+                }
+                .buttonStyle(BPActionStyle())
+                .focused($focus, equals: "cw-clear")
+                if let n = clearedCount {
+                    Text(verbatim: n == 1 ? T("Cleared 1 item") : T("Cleared %lld items", n)).font(BP.sans(13)).foregroundStyle(BP.inkMuted)
+                }
+            }
+        }
+    }
+
+    private func clearCw() async {
+        guard !clearing else { return }
+        clearing = true
+        let p = ProfilesStore.shared.active
+        let id: String = p?.id ?? "default"
+        let linked: Bool = p?.linked ?? true
+        let authKey: String? = p.flatMap { ProfilesStore.shared.stremioSession(for: $0.id)?.authKey }
+        let n: Int = (try? await HarborEngine.shared.call("rooms.clearContinueWatching", [AnyJSON.string(id), AnyJSON.bool(linked), authKey.map { AnyJSON.string($0) } ?? AnyJSON.null])) ?? 0
+        ExitSnapshotStore.shared.clearAll()
+        clearing = false
+        clearAsk = false
+        clearedCount = n
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { focus = "cw-clear" }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: BP.px(8)) {
+            if let s = layout {
+                if !s.lists.isEmpty {
+                    Text(T("Your lists on Home")).font(BP.sans(15, .semibold)).foregroundStyle(BP.inkMuted)
+                    ForEach(s.lists) { l in
+                        HStack(spacing: BP.px(8)) {
+                            Text(l.name).font(BP.sans(14, .semibold)).foregroundStyle(BP.ink).lineLimit(1).frame(width: BP.px(340), alignment: .leading)
+                            Text(verbatim: "\(l.count)").font(BP.sans(13)).foregroundStyle(BP.inkSubtle).frame(width: BP.px(48), alignment: .leading)
+                            Button(l.onHome ? T("Remove from Home") : T("Add to Home")) { Task { await call("homeListRowToggle", [.string(l.id)]) } }
+                                .buttonStyle(BPActionStyle(primary: l.onHome))
+                        }
+                    }
+                }
+                if s.simkl.connected {
+                    // lib/simkl/home-rails.ts gates: the rails as a whole, then Up Next and Trending.
+                    Text(T("Simkl rails")).font(BP.sans(15, .semibold)).foregroundStyle(BP.inkMuted)
+                    HStack(spacing: BP.px(8)) {
+                        simklSwitch("Home rails", s.simkl.home, "home")
+                        simklSwitch("Up Next rail", s.simkl.upNext, "upNext")
+                        simklSwitch("Trending rail", s.simkl.trending, "trending")
+                    }
+                }
+                if let cw = s.cw {
+                    // library-panel/home-tab.tsx "Continue Watching": cwAdvanceNext, cwHideCaughtUp,
+                    // animeCwEnd (use-cw-advance.ts reads all three, on Home and in the Anime room).
+                    Text(T("Continue Watching")).font(BP.sans(15, .semibold)).foregroundStyle(BP.inkMuted)
+                    cwSwitch("Advance Continue Watching to the next episode", cw.advanceNext, "advanceNext")
+                    cwSwitch("Remove shows once you're caught up", cw.hideCaughtUp, "hideCaughtUp")
+                    HStack(spacing: BP.px(8)) {
+                        Text(T("When the latest episode ends")).font(BP.sans(14)).foregroundStyle(BP.ink).lineLimit(1)
+                        Button(T("Hide")) { Task { await call("homeCwSetting", [.string("animeCwEnd"), .string("hide")]) } }
+                            .buttonStyle(BPActionStyle(primary: cw.animeCwEnd != "timer")).bpSelected(cw.animeCwEnd != "timer")
+                        Button(T("Timer")) { Task { await call("homeCwSetting", [.string("animeCwEnd"), .string("timer")]) } }
+                            .buttonStyle(BPActionStyle(primary: cw.animeCwEnd == "timer")).bpSelected(cw.animeCwEnd == "timer")
+                    }
+                    clearCwControls
+                }
+                Text(T("Rows")).font(BP.sans(15, .semibold)).foregroundStyle(BP.inkMuted)
+                if s.rows.isEmpty {
+                    BPNote(text: "Open Home once; its rows appear here to reorder, hide or rename.")
+                }
+                ForEach(Array(s.rows.enumerated()), id: \.element.key) { i, r in
+                    HStack(spacing: BP.px(8)) {
+                        Text(r.name).font(BP.sans(14, r.hidden ? .regular : .semibold)).foregroundStyle(r.hidden ? BP.inkSubtle : BP.ink).lineLimit(1).frame(width: BP.px(340), alignment: .leading)
+                        // The end arrows dim instead of disabling: a row moved
+                        // to the top or bottom disabled the arrow under the ring, which then jumped off
+                        // the list. The ring stays on the arrow and rides along with its row.
+                        let top = i == 0
+                        let bottom = i == s.rows.count - 1
+                        Button { if !top { Task { await call("homeRowMove", [.string(r.key), .number(-1)]) } } } label: { Image(systemName: "arrow.up") }.buttonStyle(BPActionStyle(busy: top)).accessibilityLabel(T("Move up"))
+                        Button { if !bottom { Task { await call("homeRowMove", [.string(r.key), .number(1)]) } } } label: { Image(systemName: "arrow.down") }.buttonStyle(BPActionStyle(busy: bottom)).accessibilityLabel(T("Move down"))
+                        Button(r.hidden ? T("Show") : T("Hide")) { Task { await call("homeRowToggleHidden", [.string(r.key)]) } }.buttonStyle(BPActionStyle(primary: r.hidden))
+                        // The editor opens under the list: the ring goes to its Save (the field sits just above).
+                        Button(T("Rename")) { startRename(r) }.buttonStyle(BPActionStyle())
+                            .focused($focus, equals: "rename:\(r.key)")
+                        Button(r.numerals ? T("Numbers: On") : T("Numbers: Off")) { Task { await call("homeRowToggleNumerals", [.string(r.key)]) } }.buttonStyle(BPActionStyle(primary: r.numerals))
+                    }
+                }
+                if let r = renaming {
+                    BPField(label: T("Rename %@", r.originalName), placeholder: r.originalName, text: $newName)
+                    HStack(spacing: BP.px(8)) {
+                        Button(T("Save")) { Task { await call("homeRowRename", [.string(r.key), .string(newName)]); endRename(r.key) } }.buttonStyle(BPActionStyle(primary: true))
+                            .focused($focus, equals: "rename-save")
+                        // row-controls.tsx
+                        Button(T("Reset to original name")) { Task { await call("homeRowRename", [.string(r.key), .string("")]); endRename(r.key) } }.buttonStyle(BPActionStyle())
+                            .focused($focus, equals: "rename-reset")
+                        Button(T("Cancel")) { endRename(r.key) }.buttonStyle(BPActionStyle())
+                            .focused($focus, equals: "rename-cancel")
+                    }
+                }
+                if !s.rows.isEmpty { Button(T("Reset rows")) { Task { await call("homeRowsReset", []) } }.buttonStyle(BPActionStyle()) }
+            } else {
+                BPNote(text: "Loading…")
+            }
+        }
+        .task { await load() }
+        .onChange(of: watch.tick) { _, _ in Task { await load() } }
+        // Menu closes the rename editor first (row-controls.tsx: Escape cancels
+        // the inline rename); it used to leave Settings with the editor still open.
+        .onExitCommand(perform: exitAction)
+    }
+
+    private func simklSwitch(_ label: String, _ on: Bool, _ which: String) -> some View {
+        let title: String = "\(T(label)): \(T(on ? "On" : "Off"))"
+        return Button(title) { Task { await call("homeSimklRail", [.string(which), .bool(!on)]) } }.buttonStyle(BPActionStyle(primary: on))
+    }
+
+    private func cwSwitch(_ label: String, _ on: Bool, _ which: String) -> some View {
+        let title: String = "\(T(label)): \(T(on ? "On" : "Off"))"
+        return Button(title) { Task { await call("homeCwSetting", [.string(which), .bool(!on)]) } }.buttonStyle(BPActionStyle(primary: on))
+    }
+
+    private func load() async {
+        let p = profile
+        // A failed re-read (SettingsFieldWatch now re-reads while the panel is open) keeps
+        // what is on screen: it blanked the panel to "Loading…" under the ring.
+        if let next: RowsState = try? await HarborEngine.shared.call("rooms.homeRowsState", [p.id, p.linked]) { apply(next) }
+    }
+
+    /// Every edit returns the new state; the engine raises `harbor:home-updated` for Home.
+    private func call(_ fn: String, _ args: [AnyJSON]) async {
+        let p = profile
+        if let out = try? await HarborEngine.shared.callJSON("rooms.\(fn)", [.string(p.id), .bool(p.linked)] + args), let next = try? out.decode(RowsState.self) { apply(next) }
+    }
+}
+

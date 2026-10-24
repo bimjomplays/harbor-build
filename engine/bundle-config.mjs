@@ -1,0 +1,388 @@
+// Shared esbuild configuration: the stub plugin and the JavaScriptCore-shaped options.
+// build.mjs and test/probe.mjs both use it so a probe result always matches a real build.
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+
+export const here = path.dirname(fileURLToPath(import.meta.url));
+export const upstream = path.resolve(here, "../reference/harbor/src");
+
+/**
+ * Every identifier upstream imports from any `@tauri-apps/*` package, scanned from the
+ * submodule at build time so the stub tracks upstream instead of going stale. Each one
+ * becomes an export that throws when called: a desktop-only API must fail loudly on tvOS,
+ * never return a plausible value.
+ */
+export const tauriImportedNames = (() => {
+  const names = new Set(["invoke", "isTauri", "convertFileSrc", "listen", "emit", "once"]);
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (/\.(ts|tsx|js|jsx)$/.test(e.name)) {
+        const src = fs.readFileSync(full, "utf8");
+        if (!src.includes("@tauri-apps/")) continue;
+        for (const m of src.matchAll(/import\s*(?:type\s*)?\{([^}]*)\}\s*from\s*["']@tauri-apps\/[^"']+["']/g)) {
+          for (const part of m[1].split(",")) {
+            const id = part.trim().replace(/^type\s+/, "").split(/\s+as\s+/)[0].trim();
+            if (/^[A-Za-z_$][\w$]*$/.test(id)) names.add(id);
+          }
+        }
+      }
+    }
+  };
+  try {
+    walk(upstream);
+  } catch {}
+  return Array.from(names).sort();
+})();
+
+/** The upstream commit this bundle was made from, so the app can report what it is running. */
+export const upstreamRev = (() => {
+  try {
+    return execFileSync("git", ["-C", path.resolve(here, "../reference/harbor"), "rev-parse", "--short", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "unknown";
+  }
+})();
+
+/** Full SHA of the same commit: raw.githubusercontent.com needs the full hash, not the short one,
+ * to serve upstream's static assets (e.g. the sports scenery photos) without bundling them here. */
+export const upstreamRevFull = (() => {
+  try {
+    return execFileSync("git", ["-C", path.resolve(here, "../reference/harbor"), "rev-parse", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+})();
+
+
+/** Where Harbor's own servers used to be. ".invalid" never resolves (RFC 2606); shims/fetch.js refuses it outright. */
+export const DEAD_HOST = "https://harbor.invalid";
+
+/** Reads `file` and applies each [from, to] once, failing the build when upstream's text changed. */
+function patchSource(file, label, edits) {
+  let src = fs.readFileSync(file, "utf8");
+  for (const [from, to] of edits) {
+    if (src.split(from).length !== 2) throw new Error(`harbor-tvos patch: ${label} no longer has exactly one \`${from.slice(0, 60)}\`; re-check this patch`);
+    src = src.replace(from, () => to);
+  }
+  return src;
+}
+
+export const stubs = {
+  name: "harbor-stubs",
+  setup(b) {
+    // --- TV source patches -------------------------------------------------------------------
+    // providers/anime-detail.ts animeDetails sends every ONA / OVA /
+    // special to its franchise's main TV series (kitsuMainTvSeries). A full season released as an
+    // ONA (Steel Ball Run, Netflix 2026, 12 episodes) opened as "Stone Ocean Part 3" with Stone
+    // Ocean's episodes. The TV keeps the redirect for short side entries only (3 episodes or fewer,
+    // or no count): reference/harbor stays untouched, the patch is applied as the file is bundled,
+    // and the build fails loudly if upstream's line ever changes (so the patch is re-checked).
+    b.onLoad({ filter: /[\\/]lib[\\/]providers[\\/]anime-detail\.ts$/ }, (a) => {
+      const src = fs.readFileSync(a.path, "utf8");
+      const from = "if (anime && SIDE_ENTRY_SUBTYPES.has((anime.subtype ?? \"\").toLowerCase())) {";
+      if (!src.includes(from)) throw new Error("harbor-tvos patch: anime-detail.ts side-entry line changed upstream; re-check the ONA patch");
+      const to = "if (anime && SIDE_ENTRY_SUBTYPES.has((anime.subtype ?? \"\").toLowerCase()) && !((anime.episodeCount ?? 0) > 3)) {";
+      return { contents: src.replace(from, to), loader: "ts" };
+    });
+    // Trakt's and MAL's token refresh go through Harbor's token proxy, which
+    // now answers 405, and upstream then calls setSession(null): the first expired token signed the
+    // tracker out. Every setSession(null) in these refresh paths is dropped (the session is kept),
+    // and refreshAccessToken is wrapped by engine/tokenProxy.ts guardRefresh ("reconnect needed",
+    // no second call to the dead proxy). The counts are checked so an upstream change fails the build.
+    const tokenProxyImport = `import * as __tvTokenProxy from ${JSON.stringify(path.join(here, "tokenProxy.ts"))};\n`;
+    const keepSession = (src, file, expected) => {
+      const n = src.split("setSession(null);").length - 1;
+      if (n !== expected) throw new Error(`harbor-tvos patch: ${file} has ${n} setSession(null) calls (expected ${expected}); re-check this patch`);
+      return src.replaceAll("setSession(null);", "void 0; /* harbor-tvos: a failed refresh keeps the session */");
+    };
+    const wrapRefresh = (src, file, from, to, tail) => {
+      if (!src.includes(from)) throw new Error(`harbor-tvos patch: ${file} refreshAccessToken signature changed upstream; re-check this patch`);
+      return tokenProxyImport + src.replace(from, to) + tail;
+    };
+    b.onLoad({ filter: /[\\/]lib[\\/]trakt[\\/]client\.ts$/ }, (a) => {
+      const src = keepSession(fs.readFileSync(a.path, "utf8"), "trakt/client.ts", 1);
+      return {
+        contents: wrapRefresh(src, "trakt/client.ts",
+          "async function refreshAccessToken(): Promise<TraktSession | null> {",
+          "async function upstreamRefreshAccessToken(): Promise<TraktSession | null> {",
+          "\nconst refreshAccessToken = __tvTokenProxy.guardRefresh(\"trakt\", upstreamRefreshAccessToken);\n"),
+        loader: "ts",
+      };
+    });
+    b.onLoad({ filter: /[\\/]lib[\\/]mal[\\/]auth\.ts$/ }, (a) => {
+      const src = keepSession(fs.readFileSync(a.path, "utf8"), "mal/auth.ts", 2);
+      return {
+        contents: wrapRefresh(src, "mal/auth.ts",
+          "export async function refreshAccessToken(): Promise<MalSession | null> {",
+          "async function upstreamRefreshAccessToken(): Promise<MalSession | null> {",
+          "\nexport const refreshAccessToken = __tvTokenProxy.guardRefresh(\"mal\", upstreamRefreshAccessToken);\n"),
+        loader: "ts",
+      };
+    });
+    // mal/validate.ts signs out when the refresh above returns null, or on any throw while online.
+    b.onLoad({ filter: /[\\/]lib[\\/]mal[\\/]validate\.ts$/ }, (a) => ({
+      contents: keepSession(fs.readFileSync(a.path, "utf8"), "mal/validate.ts", 2),
+      loader: "ts",
+    }));
+    // Harbor's own servers are gone (harbor.site and its sync / pub / bugs / app
+    // hosts answer with a "sunsetting" HTML page). Upstream's config/endpoints.ts defaults every base to one
+    // of them, so each fallback becomes DEAD_HOST ("harbor.invalid" can never resolve) and the engine's
+    // fetch shim rejects that host before any request leaves the device. Every proxy and feed that is not
+    // patched below (hero pool, award winners, curated logos, anime awards / hero art, ad segments, badges,
+    // IMDb, Simkl ratings, social) therefore falls straight through to its own TMDB / cache / seed fallback.
+    b.onLoad({ filter: /[\\/]lib[\\/]config[\\/]endpoints\.ts$/ }, (a) =>
+      ({ contents: patchSource(a.path, "config/endpoints.ts", [
+        ['"https://harbor.site"', JSON.stringify(DEAD_HOST)],
+        ['"https://bugs.harbor.site"', JSON.stringify(DEAD_HOST)],
+        ['"https://sync.harbor.site"', JSON.stringify(DEAD_HOST)],
+        ['"https://app.harbor.site"', JSON.stringify(DEAD_HOST)],
+      ]), loader: "ts" }));
+    // TVDB: tvdb.ts talks to api4.thetvdb.com when settings.tvdbKey is set and otherwise to Harbor's proxy.
+    // The proxy branch goes: without a key every TVDB lookup returns null at once (no request, no retry).
+    // __tvdbToken exposes its cached v4 login so tvdb-cast / tvdb-collections call v4 with the same token.
+    b.onLoad({ filter: /[\\/]lib[\\/]providers[\\/]tvdb\.ts$/ }, (a) =>
+      ({ contents: patchSource(a.path, "providers/tvdb.ts", [
+        ["const useProxy = !apiKey;", "if (!apiKey) return null;\n  const useProxy = false;"],
+      ]) + "\nexport const __tvdbToken = getToken;\n", loader: "ts" }));
+    const tvdbDirectImport = `import * as __tvTvdb from ${JSON.stringify(path.join(here, "tvdbDirect.ts"))};\n`;
+    for (const [file, re] of [["providers/tvdb-cast.ts", /[\\/]lib[\\/]providers[\\/]tvdb-cast\.ts$/], ["providers/tvdb-collections.ts", /[\\/]lib[\\/]providers[\\/]tvdb-collections\.ts$/]]) {
+      b.onLoad({ filter: re }, (a) =>
+        ({ contents: tvdbDirectImport + patchSource(a.path, file, [
+          ["const res = await safeFetch(`${V4}${rel}`);", "const res = await __tvTvdb.tvdbV4(rel);"],
+        ]), loader: "ts" }));
+    }
+    // The TVDB image / artwork aggregation ran on Harbor's server; there is no direct equivalent, so both
+    // calls reject (the callers' try/catch turns that into "no TVDB art" and the other art sources win).
+    b.onLoad({ filter: /[\\/]lib[\\/]providers[\\/]tvdb-proxy\.ts$/ }, (a) =>
+      ({ contents: patchSource(a.path, "providers/tvdb-proxy.ts", [
+        ["await safeFetch(`${ART_PROXY}?${q.toString()}`)", "await Promise.reject(new Error(\"TVDB artwork proxy is gone\"))"],
+        ["await safeFetch(`${PROXY}?${q.toString()}`)", "await Promise.reject(new Error(\"TVDB image proxy is gone\"))"],
+      ]), loader: "ts" }));
+    // IMDb ratings, episode ratings and the parental guide came from Harbor's /api/imdb proxy: dropped. Ratings
+    // fall back to OMDb / Cinemeta, the parental guide to Common Sense Media (harborImdbParental's own fallback),
+    // and episode ratings are empty.
+    b.onLoad({ filter: /[\\/]lib[\\/]providers[\\/]harbor-imdb\.ts$/ }, (a) =>
+      ({ contents: patchSource(a.path, "providers/harbor-imdb.ts", [
+        ["await fetch(`${BASE}/episodes/${seriesTt}`)", "await Promise.reject(new Error(\"IMDb proxy is gone\"))"],
+        ["await fetch(`${BASE}/title/${tt}`)", "await Promise.reject(new Error(\"IMDb proxy is gone\"))"],
+        ["await safeFetch(`${BASE}/parental/${tt}`, {\n        signal: AbortSignal.timeout(3000),\n      })", "await Promise.reject(new Error(\"IMDb proxy is gone\"))"],
+      ]), loader: "ts" }));
+    // --- Tauri desktop shell -------------------------------------------------------------
+    b.onResolve({ filter: /^@tauri-apps\// }, (a) => ({ path: a.path, namespace: "tauri-stub" }));
+    b.onLoad({ filter: /.*/, namespace: "tauri-stub" }, (a) => ({
+      loader: "js",
+      contents: [
+        `const missing = (name) => () => { throw new Error("HarborEngine: ${a.path}." + name + "() is desktop-only and is not available on tvOS"); };`,
+        // The http plugin's fetch is only reached on the Tauri branch of safe-fetch, which
+        // isTauri===false disables - but wire it to the host fetch anyway so a stray call
+        // does the right thing instead of exploding.
+        ...tauriImportedNames.map((n) =>
+          n === "fetch"
+            ? "export const fetch = (...a) => globalThis.fetch(...a);"
+            : n === "isTauri"
+              ? "export const isTauri = false;"
+              : `export const ${n} = missing(${JSON.stringify(n)});`,
+        ),
+        "export default {};",
+      ].join("\n"),
+    }));
+
+    // --- React ---------------------------------------------------------------------------
+    // Several upstream files mix pure helpers with a hook in the same module. We import the
+    // pure helpers; the hooks are never called. The stub is a CommonJS Proxy so ANY named
+    // import resolves, and every one of them throws when actually called - so a mistake
+    // shows up as a loud exception instead of a wrong value.
+    // Icon packs are pure UI: every named import becomes a component that renders nothing.
+    // CommonJS so named imports need no static export list.
+    b.onResolve({ filter: /^lucide-react($|\/)/ }, (a) => ({ path: a.path, namespace: "icon-stub" }));
+    b.onLoad({ filter: /.*/, namespace: "icon-stub" }, () => ({
+      contents: "module.exports = new Proxy({}, { get: (_, name) => name === '__esModule' ? true : function IconStub() { return null; } });",
+      loader: "js",
+    }));
+    // esbuild inlines dynamic imports in an IIFE bundle, so upstream's lazy locale catalogs
+    // (~20 MB of translations behind setUiLanguage) and the 4 MB awards JSON would land in
+    // the bundle. The app feeds both from its own bundle instead: the chosen language's catalog
+    // through settingsRoom.installUiCatalog (tools/build_locales.mjs → App/Locales/<lang>.json)
+    // and the awards through discoverRoom.installAwards, so both lazy loads resolve to empty modules.
+    b.onResolve({ filter: /(^|\/)load-locale$/ }, (a) =>
+      /lib\/i18n\//.test(a.importer) ? { path: a.path, namespace: "locale-stub" } : undefined);
+    b.onLoad({ filter: /.*/, namespace: "locale-stub" }, () => ({
+      contents: "export async function ensureUiLocale() {} export function uiLocaleReady() { return true; }",
+      loader: "js",
+    }));
+    b.onResolve({ filter: /^@\/data\/awards\.json$/ }, (a) => ({ path: a.path, namespace: "awards-stub" }));
+    // Rejecting keeps upstream's `requested` flag reset and never replaces an installed catalog.
+    b.onLoad({ filter: /.*/, namespace: "awards-stub" }, () => ({ contents: "throw new Error('HarborEngine: the awards catalog is installed by the host (discoverRoom.installAwards)');", loader: "js" }));
+    // Vite `?raw` imports are the file's text.
+    // Asset files (svg, png, …) fall through to the asset stub below; `@/` is upstream's src alias.
+    b.onResolve({ filter: /\?raw$/ }, (a) => {
+      const p = a.path.slice(0, -4);
+      if (/\.(png|jpe?g|gif|webp|avif|svg|woff2?|ttf|otf|mp3|wav|mp4|webm)$/i.test(p)) return undefined;
+      const full = p.startsWith("@/") ? path.join(upstream, p.slice(2)) : path.resolve(path.dirname(a.importer), p);
+      return { path: full, namespace: "raw-text" };
+    });
+    b.onLoad({ filter: /.*/, namespace: "raw-text" }, (a) => ({ contents: fs.readFileSync(a.path, "utf8"), loader: "text" }));
+    // Home media servers: upstream's transport is a Tauri command and its index store is
+    // IndexedDB; the bundle swaps both for engine/media/* (fetch, localStorage). Only the
+    // upstream modules themselves are redirected; engine/media imports the real files by path.
+    b.onResolve({ filter: /(^@\/lib\/media-server\/transport$)|(^\.\/transport$)/ }, (a) =>
+      a.path.startsWith("@/") || /lib\/media-server\//.test(a.importer) ? { path: path.join(here, "media/transport.ts") } : undefined);
+    b.onResolve({ filter: /(^@\/lib\/media-server\/index-store$)|(^\.\/index-store$)/ }, (a) =>
+      a.path.startsWith("@/") || /lib\/media-server\//.test(a.importer) ? { path: path.join(here, "media/index-store.ts") } : undefined);
+    // Pure helpers live in a few React view files (views/library/shared, watchlist-tab); the
+    // virtualiser they import is render-only, so it stubs like the icons do.
+    b.onResolve({ filter: /^@tanstack\/react-virtual($|\/)/ }, (a) => ({ path: a.path, namespace: "virtual-stub" }));
+    b.onLoad({ filter: /.*/, namespace: "virtual-stub" }, () => ({
+      contents: "module.exports = { __esModule: true, useVirtualizer() { throw new Error('HarborEngine: react-virtual is render-only'); }, useWindowVirtualizer() { throw new Error('HarborEngine: react-virtual is render-only'); } };",
+      loader: "js",
+    }));
+    b.onResolve({ filter: /^react($|\/)|^react-dom($|\/)|^scheduler($|\/)/ }, (a) => ({
+      path: a.path,
+      namespace: "react-stub",
+    }));
+    b.onLoad({ filter: /.*/, namespace: "react-stub" }, (a) => ({
+      loader: "js",
+      contents: `
+// Anything that only SHAPES a module (createContext, memo, forwardRef, lazy) returns an
+// inert value, because upstream calls those at module top level. Anything that RENDERS or
+// is a hook throws, so a mistake is a loud exception and never a wrong value.
+const dead = (name) =>
+  function harborReactStub() {
+    throw new Error(
+      "HarborEngine: ${a.path}." + name + "() was called, but tvOS has no React. " +
+      "Import the pure helper next to the hook instead .",
+    );
+  };
+export const Fragment = Symbol.for("react.fragment");
+export const StrictMode = Symbol.for("react.strict_mode");
+export const Suspense = Symbol.for("react.suspense");
+export const Profiler = Symbol.for("react.profiler");
+export const version = "0.0.0-harbor-stub";
+export const createContext = (defaultValue) => ({
+  $$typeof: Symbol.for("react.context"),
+  Provider: dead("Context.Provider"),
+  Consumer: dead("Context.Consumer"),
+  displayName: undefined,
+  _currentValue: defaultValue,
+  _currentValue2: defaultValue,
+});
+export const memo = (c) => c;
+export const forwardRef = (c) => c;
+export const lazy = (loader) => ({ $$typeof: Symbol.for("react.lazy"), _payload: loader });
+export const createRef = () => ({ current: null });
+export const isValidElement = () => false;
+export const Children = {
+  map: dead("Children.map"), forEach: dead("Children.forEach"),
+  count: dead("Children.count"), only: dead("Children.only"), toArray: dead("Children.toArray"),
+};
+export const useState = dead("useState");
+export const useEffect = dead("useEffect");
+export const useLayoutEffect = dead("useLayoutEffect");
+export const useInsertionEffect = dead("useInsertionEffect");
+export const useMemo = dead("useMemo");
+export const useCallback = dead("useCallback");
+export const useRef = dead("useRef");
+export const useContext = dead("useContext");
+export const useReducer = dead("useReducer");
+export const useImperativeHandle = dead("useImperativeHandle");
+export const useDebugValue = dead("useDebugValue");
+export const useSyncExternalStore = dead("useSyncExternalStore");
+export const useTransition = dead("useTransition");
+export const useDeferredValue = dead("useDeferredValue");
+export const useId = dead("useId");
+export const useOptimistic = dead("useOptimistic");
+export const useActionState = dead("useActionState");
+export const use = dead("use");
+export const startTransition = dead("startTransition");
+export const createElement = dead("createElement");
+export const cloneElement = dead("cloneElement");
+export const act = dead("act");
+export const Component = dead("Component");
+export const PureComponent = dead("PureComponent");
+// react/jsx-runtime
+export const jsx = dead("jsx");
+export const jsxs = dead("jsxs");
+export const jsxDEV = dead("jsxDEV");
+// react-dom
+export const createPortal = dead("createPortal");
+export const flushSync = dead("flushSync");
+export const findDOMNode = dead("findDOMNode");
+export const createRoot = dead("createRoot");
+export const hydrateRoot = dead("hydrateRoot");
+export const render = dead("render");
+export const unstable_batchedUpdates = (fn) => fn();
+export default {
+  Fragment, StrictMode, Suspense, Profiler, version, createContext, memo, forwardRef, lazy,
+  createRef, isValidElement, Children, useState, useEffect, useLayoutEffect, useMemo,
+  useCallback, useRef, useContext, useReducer, useSyncExternalStore, useId, createElement,
+  cloneElement, startTransition,
+};
+`,
+    }));
+
+    // --- Nav icon animations ---------------------------------------------------------------
+    // chrome/nav-items.tsx (engine/navEdit.ts reads its pure order/hide helpers) renders each tab
+    // with lottie-web and ~200 KB of Lottie JSON. Both are render-only: the player throws if
+    // ever called, the animation data is an empty object.
+    b.onResolve({ filter: /^lottie-web($|\/)/ }, (a) => ({ path: a.path, namespace: "lottie-stub" }));
+    b.onLoad({ filter: /.*/, namespace: "lottie-stub" }, () => ({
+      contents: "const dead = () => { throw new Error('HarborEngine: lottie-web is render-only'); }; export default { loadAnimation: dead }; export const loadAnimation = dead;",
+      loader: "js",
+    }));
+    b.onResolve({ filter: /[\\/]assets[\\/]lottie[\\/].*\.json$/ }, (a) => ({ path: a.path, namespace: "lottie-data-stub" }));
+    b.onLoad({ filter: /.*/, namespace: "lottie-data-stub" }, () => ({ contents: "export default {};", loader: "js" }));
+
+    // --- Vite asset imports ----------------------------------------------------------------
+    // \`import poster from "@/assets/x.png"\` is a Vite URL string. tvOS ships no web assets,
+    // so it becomes a stable "harbor-asset:" identifier the Swift side can map to a bundled
+    // image (or ignore). Never a data URI: that would put megabytes in the JS.
+    b.onResolve({ filter: /\.(png|jpe?g|gif|webp|avif|svg|woff2?|ttf|otf|mp3|wav|mp4|webm)(\?raw)?$/ }, (a) => ({
+      path: a.path.replace(/^.*[\\/]assets[\\/]/, "").replace(/\?raw$/, ""),
+      namespace: "asset-stub",
+    }));
+    b.onLoad({ filter: /.*/, namespace: "asset-stub" }, (a) => ({
+      loader: "js",
+      contents: `export default ${JSON.stringify("harbor-asset:/" + a.path)};`,
+    }));
+  },
+};
+
+export const common = {
+  bundle: true,
+  format: "iife",
+  platform: "neutral",
+  target: ["safari16"],
+  mainFields: ["module", "main"],
+  conditions: ["import", "default"],
+  alias: { "@": upstream },
+  nodePaths: [path.join(here, "node_modules")],
+  plugins: [stubs],
+  metafile: true,
+  logLevel: "warning",
+  sourcemap: false,
+  define: {
+    // Upstream is a Vite app: import.meta.env is its build-time config object. Defining the
+    // whole object (not just .DEV) keeps esbuild's "import.meta in iife" warning quiet and
+    // lets config/endpoints.ts fall back to its production defaults.
+    "import.meta.env": '{"DEV":false,"PROD":true,"MODE":"production","SSR":false}',
+    "import.meta.env.DEV": "false",
+    "import.meta.env.PROD": "true",
+    "import.meta.env.MODE": '"production"',
+    "process.env.NODE_ENV": '"production"',
+    __HARBOR_UPSTREAM_REV__: JSON.stringify(upstreamRev),
+    __HARBOR_UPSTREAM_REV_FULL__: JSON.stringify(upstreamRevFull),
+    __HARBOR_BUILT_AT__: JSON.stringify(new Date().toISOString().slice(0, 19) + "Z"),
+  },
+  loader: { ".json": "json" },
+};
+

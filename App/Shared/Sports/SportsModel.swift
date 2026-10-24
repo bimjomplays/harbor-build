@@ -1,0 +1,189 @@
+import Foundation
+import Combine
+
+/// Sports room state (use-bp-sports.ts): mode, group, day and the finished page the engine
+/// builds from upstream's hub feeds. The engine serves cache first and raises
+/// `harbor:sports-updated` as feeds land; we re-read the page on each one.
+@MainActor
+final class SportsModel: ObservableObject {
+    struct Side: Decodable, Equatable { var id: String; var name: String; var abbr: String; var logo: String; var score: String; var winner: Bool; var record: String?; var rank: Int? }
+    struct Context: Decodable, Equatable { var id: String; var name: String; var round: String; var draw: String; var venue: String; var major: Bool }
+    struct Game: Decodable, Identifiable, Equatable {
+        var id: String; var league: String; var state: String; var detail: String
+        var home: Side; var away: Side
+        var startMs: Double; var dateOnly: String?; var context: Context?; var source: String?
+        var artwork: String?; var poster: String?; var broadcasts: [String]?; var savedAt: Double?
+        var key: String; var leagueLabel: String; var leagueLogo: String; var group: String
+        var statusText: String; var live: Bool; var single: Bool; var faceOff: Bool; var headline: String; var quiet: String; var startLabel: String
+        // Only the fields the engine needs back for detail(); Encodable via a trimmed mirror.
+        var wire: AnyJSON {
+            var o: [String: AnyJSON] = ["id": .string(id), "league": .string(league), "state": .string(state), "detail": .string(detail), "startMs": .number(startMs),
+                                        "home": side(home), "away": side(away)]
+            if let source { o["source"] = .string(source) }
+            if let dateOnly { o["dateOnly"] = .string(dateOnly) }
+            // watchProviders / channel matching read the listed broadcasters (watch-providers.ts).
+            if let broadcasts { o["broadcasts"] = .array(broadcasts.map { .string($0) }) }
+            if let c = context { o["context"] = .object(["id": .string(c.id), "name": .string(c.name), "round": .string(c.round), "draw": .string(c.draw), "venue": .string(c.venue), "major": .bool(c.major)]) }
+            return .object(o)
+        }
+        private func side(_ s: Side) -> AnyJSON {
+            .object(["id": .string(s.id), "name": .string(s.name), "abbr": .string(s.abbr), "logo": .string(s.logo), "score": .string(s.score), "winner": .bool(s.winner)])
+        }
+    }
+    struct Row: Decodable, Identifiable { var key: String; var title: String; var description: String?; var games: [Game]; var id: String { key } }
+    struct Chip: Decodable, Identifiable { var key: String; var label: String; var icon: String?; var id: String { key } }
+    struct Status: Decodable { var busy: Bool; var failed: Bool; var failedKeys: [String]; var stale: Bool; var at: Double; var note: String? }
+    struct Page: Decodable {
+        var mode: String; var group: String; var groups: [Chip]; var showGroups: Bool
+        var day: String; var today: String; var liveDays: [String]; var dateTitle: String
+        var heroes: [Game]; var rows: [Row]; var status: Status; var empty: Bool; var personalized: Bool; var explore: [Chip]
+    }
+    /// bp-sports-date-band: weekday over the day of the month (`number`).
+    struct Day: Decodable, Identifiable { var key: String; var label: String; var number: Int?; var today: Bool; var id: String { key } }
+    struct Consent: Decodable { var status: String }
+
+    enum Mode: String, CaseIterable { case forYou = "for-you", live, schedule, hot, explore
+        var label: String { switch self { case .forYou: return "For you"; case .live: return "Live now"; case .schedule: return "Schedule"; case .hot: return "Hot"; case .explore: return "Explore" } }
+    }
+
+    /// "" until the engine has answered (upstream reads the stored receipt synchronously). Starting
+    /// at "unknown" drew the whole consent notice for a frame or more every time the tab opened.
+    @Published private(set) var consent: String = ""
+    @Published private(set) var page: Page?
+    @Published private(set) var days: [Day] = []
+    @Published private(set) var loading = false
+    @Published var mode: Mode = .forYou
+    @Published var group: String = "all"
+    @Published var day: String?
+    @Published private(set) var browsing = false
+
+    private var unsubscribe: (() -> Void)?
+    private var reloadTask: Task<Void, Never>?
+    private var poll: Task<Void, Never>?
+    /// bp-view-state `sportsMode` (useBpPersistedState): the mode survives
+    /// leaving the tab for the rest of the session and resets when the profile changes
+    /// (use-bp-profile-reset). The room came back on For you after every visit to another tab.
+    private static var kept: (profile: String, mode: Mode)?
+    private var restored = false
+
+    deinit { poll?.cancel(); reloadTask?.cancel(); unsubscribe?() }
+
+    func start() async {
+        if !restored {
+            restored = true
+            // Before the consent read: nothing of the room is drawn yet, so no chip flips.
+            let who: String = ProfilesStore.shared.active?.id ?? ""
+            if let k = Self.kept, k.profile == who { mode = k.mode }
+        }
+        consent = ((try? await HarborEngine.shared.call("sports.consent", [])) as Consent?)?.status ?? "unknown"
+        guard consent == "accepted" else { return }
+        // sports-reminder-loop: the engine's 30 s reminder timer (runs only while Harbor is open;
+        // tvOS cannot send a webhook reminder in the background). Idempotent.
+        _ = try? await HarborEngine.shared.callJSON("sports.startReminders", [])
+        if unsubscribe == nil {
+            unsubscribe = HarborEngine.shared.onEvent { [weak self] type, _ in
+                guard type == "harbor:sports-updated" else { return }
+                self?.scheduleReload()
+            }
+        }
+        // weekday labels in Harbor's UI language, as the upstream date band does.
+        days = (try? await HarborEngine.shared.call("sports.days", [AnyJSON.null, AnyJSON.string(L10n.language)])) ?? []
+        await reload()
+        // A cover that came up while this start was still reading (an event
+        // or a player opened in the first second) cancelled its `.task` and stopped polling before
+        // the poll below existed: the 60 s reload then ran under the cover until it closed.
+        if Task.isCancelled { return }
+        poll?.cancel()
+        poll = Task { [weak self] in
+            // use-hub.ts: 60 s repoll for day/live boards (the engine decides what is fresh).
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                await self?.reload()
+            }
+        }
+    }
+
+    /// use-hub.ts only polls while the room is visible; a player or page covering
+    /// Sports stopped nothing, so the 60 s reload kept running under it. `.task` restarts it.
+    func stopPolling() { poll?.cancel(); poll = nil }
+
+    func accept() async {
+        consent = ((try? await HarborEngine.shared.call("sports.accept", [])) as Consent?)?.status ?? "accepted"
+        SettingsBridge.shared.sportsDeclined = consent == "declined"   // see decline()
+        await start()
+    }
+
+    func decline() async {
+        consent = ((try? await HarborEngine.shared.call("sports.decline", [])) as Consent?)?.status ?? "declined"
+        // bp-top-bar useBpTabGate follows the consent live: "Decline and hide Sports"
+        // hides the tab now, not the next time Settings happens to load its categories.
+        SettingsBridge.shared.sportsDeclined = consent == "declined"
+    }
+
+    /// Coalesce bursts of slice arrivals (upstream shares one render per 80 ms burst).
+    private func scheduleReload() {
+        reloadTask?.cancel()
+        reloadTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            await self?.reload()
+        }
+    }
+
+    private var generation = 0
+
+    func reload(force: Bool = false) async {
+        generation += 1
+        let mine = generation
+        loading = true; defer { if mine == generation { loading = false } }
+        // use-bp-sports.ts formats with useUiLanguage(), Harbor's own language setting;
+        // Locale.current is the Apple TV's, so dates and countdowns came out in another language.
+        let input: AnyJSON = .object(["mode": .string(mode.rawValue), "group": .string(group), "day": day.map { .string($0) } ?? .null,
+                                      "browsing": .bool(browsing), "force": .bool(force), "locale": .string(L10n.language)])
+        // Four callers can overlap (poll, event debounce, chip presses); only the newest reply lands.
+        if let p: Page = try? await HarborEngine.shared.call("sports.page", [input]), mine == generation {
+            let was: String? = page?.today
+            page = p
+            if let was, was != p.today { rollDay(from: was, to: p.today) }
+        }
+    }
+
+    /// use-bp-sports.ts re-reads today every minute while the room is up: a
+    /// picked day that was today follows it, and the date band re-anchors on the new today. A
+    /// viewer left on Sports over midnight kept yesterday's "Today" cell and board.
+    private func rollDay(from was: String, to now: String) {
+        Task { [weak self] in
+            let fresh: [Day] = (try? await HarborEngine.shared.call("sports.days", [AnyJSON.null, AnyJSON.string(L10n.language)])) ?? []
+            guard !fresh.isEmpty else { return }
+            self?.days = fresh
+        }
+        if day == was {
+            day = now
+            Task { await reload() }
+        }
+    }
+
+    private func keep(_ m: Mode) {
+        let who: String = ProfilesStore.shared.active?.id ?? ""
+        Self.kept = (profile: who, mode: m)
+    }
+
+    func setMode(_ m: Mode) {
+        mode = m
+        keep(m)
+        if m != .schedule { day = nil }
+        if m == .forYou || m == .live { group = "all"; browsing = false }
+        Task { await reload() }
+    }
+
+    func setGroup(_ key: String) { group = key; browsing = false; Task { await reload() } }
+    func browse(_ key: String) { browsing = true; group = key; mode = .forYou; keep(.forYou); Task { await reload() } }
+    func setDay(_ key: String) { day = key; Task { await reload() } }
+
+    func setLeagues(_ keys: [String]) async {
+        // The active profile's settings (source key + mirror), as upstream's update({ sportsLeagues }).
+        let p = ProfilesStore.shared.active
+        _ = try? await HarborEngine.shared.callJSON("sports.setLeagues", [.array(keys.map { .string($0) }), .string(p?.id ?? "default"), .bool(p?.linked ?? true)])
+        await reload(force: true)
+    }
+}
