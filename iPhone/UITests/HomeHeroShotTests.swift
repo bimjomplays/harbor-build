@@ -52,8 +52,8 @@ final class HomeHeroShotTests: XCTestCase {
         snap("home-hero-spotlight")
 
         // Scrolled: the status bar keeps a scrim over the rows, no dark bar.
-        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.95))
-        let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.72))
+        let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08))
         start.press(forDuration: 0.05, thenDragTo: end)
         pause(1)
         snap("home-hero-scrolled")

@@ -44,10 +44,8 @@ struct PhoneHomeView: View {
     @State private var overscroll: CGFloat = 0
     @State private var pastHero = false
     /// What the scroll view puts above its content (the status bar's height unless the screen's top edge is
-    /// ignored, as below: then 0), and where this screen's top edge sits in the window. Both read what is
-    /// there instead of assuming it, so the hero lands on the top of the screen either way.
+    /// ignored, as below: then 0). Read, not assumed, so the hero lands on the top of the screen either way.
     @State private var scrollInset: CGFloat = 0
-    @State private var originY: CGFloat = 0
     /// `scrollInset` is read once, at rest: a refresh holds the content down with an inset of its own.
     @State private var insetMeasured = false
     @State private var refreshing = false
@@ -81,7 +79,6 @@ struct PhoneHomeView: View {
         }
         // The feed starts at the screen's top edge, under the status bar and the Dynamic Island.
         .ignoresSafeArea(.container, edges: .top)
-        .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minY } action: { originY = $0 }
         .task(id: profiles.activeId) { await start() }
         // A pass read Continue Watching afresh: the cards removed from it are gone from the source too.
         .onChange(of: loader.passes) { _, _ in titleActions.resetDismissed() }
@@ -175,7 +172,6 @@ struct PhoneHomeView: View {
         LinearGradient(colors: [BP.canvas.opacity(0.92), BP.canvas.opacity(0.7), BP.canvas.opacity(0)], startPoint: .top, endPoint: .bottom)
             .frame(height: topInset + 28)
             .opacity(pastHero ? 1 : 0)
-            .offset(y: -originY)
             .allowsHitTesting(false)
     }
 
@@ -215,7 +211,6 @@ struct PhoneHomeView: View {
         }
         .padding(.horizontal, 20)
         .padding(.top, topInset + 6)
-        .offset(y: -originY)
     }
 
     /// The buttons' height plus their gaps: the room a feed without a hero leaves under the status bar.
