@@ -55,6 +55,12 @@ struct PhonePlayerView: View {
     @State var pull: CGFloat = 0
     /// The gear menu is open: the HUD stays.
     @State var menuOpen = false
+    /// The scrub preview's frames. Held, not observed: only the plate over the bar watches it, so a new
+    /// frame redraws the plate and not the player.
+    @State var preview = PhoneScrubPreview()
+    /// Under fixtures: the last drag's spot, still drawn a moment after the finger lifts (for the shots).
+    @State var scrubLinger: Double?
+    @State var lingerTask: Task<Void, Never>?
     let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     init(target: PhonePlayerTarget, hoisted: Bool) {
@@ -156,6 +162,7 @@ struct PhonePlayerView: View {
             session.appeared()
         }
         .onDisappear {
+            preview.close()
             session.disappeared()
             PhoneMiniState.shared.clear()
             DisplayAwake.shared.hold(awake, awake: false)
@@ -168,8 +175,10 @@ struct PhonePlayerView: View {
         // phone's own brightness comes back while Harbor is away.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             brightness.restore()
+            preview.close()
             session.didEnterBackground()
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in preview.trim() }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in session.willEnterForeground() }
         .onChange(of: session.pipActive) { _, on in pipChanged(on) }
         .confirmationDialog(T("Picture in Picture and AirPlay"), isPresented: Binding(get: { offer != nil }, set: { if !$0 { offer = nil } }),
@@ -198,7 +207,11 @@ struct PhonePlayerView: View {
             if paused, holding { endHold() }
             holdAwake()
         }
-        .onChange(of: session.reloadToken) { _, _ in session.reloadTokenChanged() }
+        .onChange(of: session.reloadToken) { _, _ in
+            preview.close()
+            session.reloadTokenChanged()
+        }
+        .onChange(of: session.pendingSeek) { old, new in scrubMoved(from: old, to: new) }
         .motion(.easeOut(duration: 0.25), value: session.chrome)
         .motion(.easeOut(duration: 0.25), value: session.leaveConfirm)
         .motion(.easeOut(duration: 0.2), value: lock.locked)
@@ -211,6 +224,31 @@ struct PhonePlayerView: View {
     /// may sleep as usual.
     func holdAwake() {
         DisplayAwake.shared.hold(awake, awake: session.status.state == "playing" && !session.isPaused)
+    }
+
+    /// The scrub preview follows the pending spot: a frame for it while the finger drags, none once it
+    /// lands. Under fixtures the last spot stays drawn 6 s (the shots are taken after the finger lifts).
+    func scrubMoved(from old: Double?, to new: Double?) {
+        if let new {
+            lingerTask?.cancel()
+            scrubLinger = nil
+            guard !session.isLive else { return }
+            let duration: Double = session.clock.snap.duration
+            let plan = PhoneScrubPreview.plan(url: session.playURL, headers: session.playHeaders, engine: session.engine, duration: duration)
+            preview.prepare(key: plan.key, duration: duration, config: plan.config, make: plan.make)
+            preview.update(new)
+        } else if let old, PlayerFixtures.hudHideAfter != nil {
+            scrubLinger = old
+            lingerTask?.cancel()
+            lingerTask = Task {
+                try? await Task.sleep(for: .seconds(6))
+                guard !Task.isCancelled else { return }
+                scrubLinger = nil
+                preview.update(nil)
+            }
+        } else {
+            preview.update(nil)
+        }
     }
 
     // MARK: the engine

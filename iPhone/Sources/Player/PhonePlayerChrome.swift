@@ -263,15 +263,18 @@ extension PhonePlayerView {
     }
 
     /// bp-player-scrub.tsx on the phone: a thin bar (played over buffered), the times under it. A finger
-    /// on the bar (or a sideways drag on the picture) moves a pending spot, drawn with a knob and a time
-    /// bubble over it, that lands when it lifts. No trickplay thumbnail: neither engine gives one.
+    /// on the bar (or a sideways drag on the picture) moves a pending spot, drawn with a knob and, over it,
+    /// a small frame of the film at that time with the time under it (PhoneScrubPreview: a decoder of its
+    /// own), or the time alone while there is no frame; the spot lands when the finger lifts.
     func scrubber(_ c: PlayerClock) -> some View {
         let duration: Double = c.snap.duration
-        let shown: Double = session.pendingSeek ?? c.snap.position
-        let labels = PhonePlayerHUD.labels(position: c.snap.position, duration: duration, pending: session.pendingSeek)
+        // Under fixtures the drag's look stays a moment after the finger lifts (scrubLinger), for the shots.
+        let scrubbing: Double? = session.pendingSeek ?? scrubLinger
+        let shown: Double = scrubbing ?? c.snap.position
+        let labels = PhonePlayerHUD.labels(position: c.snap.position, duration: duration, pending: scrubbing)
         let played: CGFloat = CGFloat(PhonePlayerHUD.barFraction(position: shown, duration: duration))
         let buffered: CGFloat = CGFloat(PhonePlayerHUD.barFraction(position: max(c.buffered, shown), duration: duration))
-        let dragging: Bool = session.pendingSeek != nil
+        let dragging: Bool = scrubbing != nil
         let bar: CGFloat = dragging ? 8 : 5
         return VStack(spacing: 0) {
             GeometryReader { g in
@@ -285,15 +288,6 @@ extension PhonePlayerView {
                             .frame(width: 16, height: 16)
                             .shadow(color: Color.black.opacity(0.35), radius: 3, y: 1)
                             .position(x: w * played, y: g.size.height / 2)
-                        Text(verbatim: PlayerClock.fmt(shown))
-                            .font(.system(size: 15, weight: .semibold))
-                            .monospacedDigit()
-                            .foregroundStyle(Color.white)
-                            .padding(.horizontal, 12).padding(.vertical, 6)
-                            .glassEffect(.regular, in: .capsule)
-                            .fixedSize()
-                            .position(x: min(max(w * played, 36), max(36, w - 36)), y: -22)
-                            .accessibilityIdentifier("player-scrub-time")
                     }
                 }
                 .frame(maxHeight: .infinity)
@@ -325,6 +319,16 @@ extension PhonePlayerView {
                 }
             }
             .accessibilityIdentifier("player-scrubber")
+            // Over the finger: the preview frame with the time (PhoneScrubPlate), or the time alone. Outside
+            // the bar's own accessibility element, so the tests see it.
+            .overlay {
+                if dragging {
+                    GeometryReader { g in
+                        PhoneScrubPlate(preview: preview, time: shown, x: g.size.width * played, width: g.size.width)
+                    }
+                    .allowsHitTesting(false)
+                }
+            }
             HStack {
                 Text(verbatim: labels.elapsed).accessibilityIdentifier("player-elapsed")
                 Spacer()

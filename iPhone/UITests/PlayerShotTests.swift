@@ -3,8 +3,8 @@ import XCTest
 /// The phone player laid out like Infuse, in landscape on the fixture film, dressed by `--phone-player-demo`
 /// (a real film still as the picture, Infuse-like audio and subtitle tracks). Attaches a screenshot of each
 /// state: the HUD playing, paused, the gear menu and each of its lists, the brightness pill, the volume
-/// capsule on its own, the 2x pill and the double tap's ripple. CI exports the attachments (ci/build.yml,
-/// "Player screenshots"); they are compared side by side with Infuse's own.
+/// capsule on its own, the 2x pill, the double tap's ripple and the scrub preview over the bar. CI exports
+/// the attachments (ci/build.yml, "Player screenshots"); they are compared side by side with Infuse's own.
 ///
 /// The English UI is assumed. The still comes from TMDB's public image host, so this test needs the network
 /// (the shots wait for it, and are still taken without it).
@@ -184,5 +184,15 @@ final class PlayerShotTests: XCTestCase {
         wakeHUD(app)
         pause(1)
         snap("13-hud-again")
+
+        // A drag along the bar: the preview frame over the finger, the time under it (under fixtures it
+        // stays 6 s after the finger lifts, so it is shot then, before the slower element check).
+        let bar = expect(app, "player-scrubber", timeout: 5)
+        bar.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 0.5))
+            .press(forDuration: 0.3, thenDragTo: bar.coordinate(withNormalizedOffset: CGVector(dx: 0.62, dy: 0.5)),
+                   withVelocity: .slow, thenHoldForDuration: 1.2)
+        pause(0.4)
+        snap("14-scrub-preview")
+        expect(app, "player-scrub-preview", timeout: 4)
     }
 }

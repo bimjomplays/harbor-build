@@ -3,7 +3,7 @@
 #  - engine:     TypeScript engine bundle + its offline tests, Rust library tests (Linux)
 #  - apps:       Rust xcframework, both apps built for the simulator, iPhone unit tests (macOS)
 #  - testflight: both apps archived (unsigned), then exported with cloud signing and uploaded to TestFlight
-#                (main pushes and manual runs)
+#                (main pushes and manual runs; ci/** branches, from publish-public.sh --branch, only build and test)
 # Secrets: UPSTREAM_SSH_KEY (read-only deploy key of the private upstream repo), HARBOR_BUNDLE_ID,
 # APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (App Store Connect API key).
 # The repo is public: logs stay in the job output (where secrets are masked), never uploaded as files. The one upload is
@@ -11,7 +11,7 @@
 name: build
 on:
   push:
-    branches: [main]
+    branches: [main, 'ci/**']
   workflow_dispatch:
     inputs:
       testflight:
@@ -168,7 +168,8 @@ jobs:
           if-no-files-found: ignore
       - name: Player screenshots
         # The player laid out like Infuse, in landscape on the 6.9" iPhone, from the UI test that attaches each state
-        # (HUD, paused, gear menu and its lists, brightness, volume, 2x, double tap). Informational, like the hero shots.
+        # (HUD, paused, gear menu and its lists, brightness, volume, 2x, double tap, scrub preview). Informational, like
+        # the hero shots.
         continue-on-error: true
         run: |
           udid=$(xcrun simctl list devices available -j | python3 -c '
@@ -202,7 +203,7 @@ jobs:
 
   testflight:
     needs: [engine, apps]
-    if: github.event_name == 'push' || inputs.testflight
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || inputs.testflight
     runs-on: macos-26
     timeout-minutes: 60
     strategy:
