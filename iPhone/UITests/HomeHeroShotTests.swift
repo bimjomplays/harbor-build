@@ -1,12 +1,17 @@
+import UIKit
 import XCTest
 
 /// Home's hero ("Spotlight": art to the very top, floating glass buttons) on the fixture feed, dressed with
 /// real art by `--phone-hero-demo`. Attaches screenshots of the top of Home at rest and after a scroll, and
 /// checks the controls are there. CI exports the attachments (ci/build.yml, "Home hero screenshots").
 ///
-/// The English UI is assumed. The art comes from Cinemeta's public image host, so this one test needs the
-/// network (the screenshot waits for it, and still attaches what it has).
+/// The English UI is assumed. The art comes from TMDB's and Cinemeta's public image hosts, so this one test needs
+/// the network (the screenshot waits for it, and still attaches what it has).
 final class HomeHeroShotTests: XCTestCase {
+    /// The fixture's backdrop (PhoneHomeDemo.backdrop in the app): a real title's landscape TMDB backdrop, the
+    /// shape every real hero gets, so the shots show how much of it the hero crops.
+    private let backdrop = "https://image.tmdb.org/t/p/w780/4NmCfWHzytiKM3riCMcbVYBJhlB.jpg"
+
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
@@ -36,6 +41,18 @@ final class HomeHeroShotTests: XCTestCase {
         _ = XCTWaiter().wait(for: [wait], timeout: seconds)
     }
 
+    /// The fixture's backdrop is landscape 16:9 (a portrait picture would hide how much the hero crops), and
+    /// is attached next to the shots.
+    func testFixtureBackdropIsLandscape() throws {
+        let data = try Data(contentsOf: XCTUnwrap(URL(string: backdrop)))
+        let image = try XCTUnwrap(UIImage(data: data), "the backdrop did not decode")
+        XCTAssertEqual(image.size.width / image.size.height, 16.0 / 9.0, accuracy: 0.02, "the backdrop is \(image.size)")
+        let attachment = XCTAttachment(image: image)
+        attachment.name = "fixture-backdrop"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     func testSpotlightHero() throws {
         let app = launchHarbor(["--fixtures", "shell", "--phone-hero-demo"])
         XCTAssertTrue(app.tabBars.firstMatch.waitForExistence(timeout: 30), "no tab bar")
@@ -47,7 +64,11 @@ final class HomeHeroShotTests: XCTestCase {
         XCTAssertTrue(element(app, "home-edit").exists, "no filter button")
         XCTAssertTrue(element(app, "account-button").exists, "no profile button")
         // The art is at the top edge: the hero starts at y = 0.
-        XCTAssertLessThanOrEqual(element(app, "hero-carousel").frame.minY, 1, "the hero does not start at the top of the screen")
+        let hero = element(app, "hero-carousel").frame
+        XCTAssertLessThanOrEqual(hero.minY, 1, "the hero does not start at the top of the screen")
+        // Short: the art is a band near a backdrop's own shape and the text runs on under it (451 pt on a 440 pt
+        // wide screen, where the old hero was 535 pt of zoomed art).
+        XCTAssertLessThan(hero.height, hero.width * 1.1, "the hero is \(hero.size), too tall")
         pause(10)
         snap("home-hero-spotlight")
 

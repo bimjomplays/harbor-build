@@ -78,6 +78,13 @@ final class PhonePerformanceTests: XCTestCase {
         XCTAssertNil(PhoneArt.still(nil))
     }
 
+    func testHeroBackdropAsksForW1280() {
+        XCTAssertEqual(PhoneArt.backdrop("https://image.tmdb.org/t/p/w780/abc.jpg"), "https://image.tmdb.org/t/p/w1280/abc.jpg")
+        XCTAssertEqual(PhoneArt.backdrop("https://image.tmdb.org/t/p/original/abc.jpg"), "https://image.tmdb.org/t/p/original/abc.jpg")
+        XCTAssertEqual(PhoneArt.backdrop("https://images.metahub.space/background/medium/tt1/img"), "https://images.metahub.space/background/medium/tt1/img")
+        XCTAssertNil(PhoneArt.backdrop(nil))
+    }
+
     // MARK: Memory
 
     /// Decodes 200 posters the way a long Library grid does and keeps them all alive: at drawn size that is

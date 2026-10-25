@@ -64,6 +64,13 @@ enum PhoneArt {
     static func still(_ url: String?) -> String? {
         url?.replacingOccurrences(of: "image.tmdb.org/t/p/original/", with: "image.tmdb.org/t/p/w780/")
     }
+
+    /// A backdrop drawn across the whole screen (Home's hero): the engine hands TMDB's w780 (780x439), which a
+    /// 440 pt screen draws 1320 px wide, so it went soft. w1280 is a size every TMDB backdrop has and about
+    /// matches the screen's pixels. Any other url (another size, another host) comes back unchanged.
+    static func backdrop(_ url: String?) -> String? {
+        url?.replacingOccurrences(of: "image.tmdb.org/t/p/w780/", with: "image.tmdb.org/t/p/w1280/")
+    }
 }
 
 /// The title written on the plate when a poster or backdrop has no picture to show.

@@ -7,19 +7,36 @@ import SwiftUI
 /// finger is on it.
 ///
 /// The hero is `height` tall counting from the screen's top edge: Home shifts it up by the top safe area
-/// (PhoneHomeView), so the art starts at y = 0 and everything below is laid out as if it began there.
+/// (PhoneHomeView), so the art starts at y = 0 and everything below is laid out as if it began there. The art is
+/// a band across the top `artHeight` tall, close to a backdrop's own 16:9 shape; the text block runs from over the
+/// art's lower part down onto the canvas under it.
 struct PhoneHero: View {
-    /// The hero's share of the screen's height, and the least and most it takes (points). Short on purpose: the
-    /// art fills the whole hero, so a tall hero crops a landscape backdrop to a narrow middle slice. At about
-    /// 1.2x the screen's width (a bit taller than square) the art shows most of the picture, the text block
-    /// still fits under the floating buttons, and the art still runs to the top edge.
-    static func height(forScreen screen: CGFloat) -> CGFloat { min(580, max(440, screen * 0.56)) }
+    /// The art band's height for a screen `width` points wide (its short side). A backdrop is 16:9, so at the
+    /// screen's width it is 0.5625x as tall as wide; the band is 0.68x, a little taller so it also covers the
+    /// status bar, and aspect-filling the backdrop into it crops only its sides: 83% of the picture's width
+    /// shows (440 x 299 pt on a 6.9" iPhone). The old hero drew the art over the whole 535 pt hero, which showed
+    /// 46%: a narrow, zoomed middle slice.
+    static func artHeight(forWidth width: CGFloat) -> CGFloat { (max(320, width) * 0.68).rounded() }
+
+    /// The hero's height: the art band and the text block's part below it (the facts, the buttons, the dots).
+    /// The kicker and the logo sit over the art's lower part.
+    static func height(forWidth width: CGFloat) -> CGFloat { artHeight(forWidth: width) + belowArt }
+
+    /// How far the hero runs past the bottom of its art.
+    static let belowArt: CGFloat = 152
+
+    /// The share of a picture's width (aspect = width / height) the art band shows on a screen `width` wide.
+    static func visibleShare(aspect: CGFloat, width: CGFloat) -> CGFloat {
+        min(1, width / (artHeight(forWidth: width) * aspect))
+    }
 
     let items: [Meta]
     /// "#1 in Top 10 Today" and the like, by title id: only titles that really rank get one.
     var kickers: [String: String] = [:]
     /// The hero's height from the top edge of the screen.
     let height: CGFloat
+    /// The art band's height from the top edge of the screen.
+    let artHeight: CGFloat
     /// How far the feed is pulled down past its top (pull to refresh, rubber banding): the art grows to
     /// fill it, so no gap opens above the hero.
     var stretch: CGFloat = 0
@@ -42,7 +59,8 @@ struct PhoneHero: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(spacing: 0) {
                     ForEach(items) { meta in
-                        PhoneHeroPage(meta: meta, kicker: kickers[meta.id], height: height, stretch: stretch, open: open, play: play)
+                        PhoneHeroPage(meta: meta, kicker: kickers[meta.id], height: height, artHeight: artHeight, stretch: stretch,
+                                      open: open, play: play)
                             .containerRelativeFrame(.horizontal)
                             .id(meta.id)
                     }
@@ -122,6 +140,7 @@ private struct PhoneHeroPage: View {
     let meta: Meta
     let kicker: String?
     let height: CGFloat
+    let artHeight: CGFloat
     let stretch: CGFloat
     let open: (Meta) -> Void
     let play: (Meta) -> Void
@@ -133,7 +152,8 @@ private struct PhoneHeroPage: View {
 
     private var saved: Bool { actions.isSaved(meta, marks: marks.byId[meta.id]) }
     private var logoURL: String? { meta.logo ?? resolvedLogo }
-    private var artURL: String? { meta.background ?? meta.poster }
+    /// The backdrop (TMDB's at w1280, sharp at the screen's width); the poster only when there is none.
+    private var artURL: String? { PhoneArt.backdrop(meta.background) ?? meta.poster }
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
@@ -175,9 +195,19 @@ private struct PhoneHeroPage: View {
         }
     }
 
-    /// The art with its scrims, edge to edge. Pulled past the top, it grows from its bottom edge so the
-    /// top stays glued to the screen's.
+    /// The art band with its scrims, edge to edge across the top of the page, then the canvas: the whole page
+    /// opens the title. Pulled past the top, the band grows from its bottom edge so its top stays glued to the
+    /// screen's.
     private var art: some View {
+        VStack(spacing: 0) {
+            band
+            Color.clear
+        }
+        .frame(height: height)
+        .contentShape(Rectangle())
+    }
+
+    private var band: some View {
         ZStack {
             // No backdrop (or none yet): an accent wash instead of a dark hole.
             LinearGradient(colors: [BP.accent.opacity(0.38), BP.surface], startPoint: .top, endPoint: .bottom)
@@ -192,18 +222,18 @@ private struct PhoneHeroPage: View {
             // The left side darkens under the text.
             LinearGradient(colors: [BP.canvas.opacity(0.55), BP.canvas.opacity(0)], startPoint: .leading, endPoint: UnitPoint(x: 0.7, y: 0.5))
                 .mask(LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: UnitPoint(x: 0.5, y: 0.35)))
-                .frame(height: height * 0.5)
+                .frame(height: artHeight * 0.55)
                 .frame(maxHeight: .infinity, alignment: .bottom)
-            // Into the canvas at the bottom.
-            LinearGradient(stops: [.init(color: BP.canvas.opacity(0), location: 0.38),
-                                   .init(color: BP.canvas.opacity(0.5), location: 0.56),
-                                   .init(color: BP.canvas.opacity(0.88), location: 0.76),
+            // Into the canvas at the bottom, under the kicker and the logo.
+            LinearGradient(stops: [.init(color: BP.canvas.opacity(0), location: 0.45),
+                                   .init(color: BP.canvas.opacity(0.42), location: 0.62),
+                                   .init(color: BP.canvas.opacity(0.85), location: 0.8),
                                    .init(color: BP.canvas, location: 0.98)],
                            startPoint: .top, endPoint: .bottom)
         }
-        .frame(height: height)
+        .frame(height: artHeight)
         .clipped()
-        .scaleEffect(1 + stretch / max(1, height), anchor: .bottom)
+        .scaleEffect(1 + stretch / max(1, artHeight), anchor: .bottom)
     }
 
     @ViewBuilder private var title: some View {

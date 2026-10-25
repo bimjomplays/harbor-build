@@ -75,4 +75,6 @@ enum PhoneScreen {
 
     static var topInset: CGFloat { window?.safeAreaInsets.top ?? 0 }
     static var height: CGFloat { window?.bounds.height ?? 0 }
+    /// The screen's short side: its width in portrait, and the same while the player turns it to landscape.
+    static var width: CGFloat { window.map { min($0.bounds.width, $0.bounds.height) } ?? 0 }
 }

@@ -36,9 +36,9 @@ struct PhoneHomeView: View {
     @State private var editing = false
     /// The profile the loader last loaded for: coming back to the tab refreshes in place.
     @State private var loadedProfile: String?
-    /// The status bar's height and the screen's, for the hero that runs under the bar (PhoneScreen).
+    /// The status bar's height and the screen's width, for the hero that runs under the bar (PhoneScreen).
     @State private var topInset: CGFloat = PhoneScreen.topInset
-    @State private var screenHeight: CGFloat = PhoneScreen.height
+    @State private var screenWidth: CGFloat = PhoneScreen.width
     /// How far the feed is pulled down past its top (the hero grows to fill it), and whether it has
     /// scrolled off the hero (the status bar then gets a scrim of its own).
     @State private var overscroll: CGFloat = 0
@@ -69,7 +69,7 @@ struct PhoneHomeView: View {
     /// and the addon catalogs and has no automatic hero, as the engine builds it.
     private var homeMode: String { mode.override ?? settings.slice.homeMode }
 
-    private var heroHeight: CGFloat { PhoneHero.height(forScreen: screenHeight) }
+    private var heroHeight: CGFloat { PhoneHero.height(forWidth: screenWidth) }
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -162,7 +162,7 @@ struct PhoneHomeView: View {
         }
         .onGeometryChange(for: CGSize.self) { $0.size } action: { _ in
             topInset = PhoneScreen.topInset
-            screenHeight = PhoneScreen.height
+            screenWidth = PhoneScreen.width
         }
         .accessibilityIdentifier("feed-home")
     }
@@ -242,8 +242,8 @@ struct PhoneHomeView: View {
     @ViewBuilder private func loadedContent(_ content: HomeContent) -> some View {
         let lead: [Meta] = PhoneHomeDemo.heroArt(content.hero.uniquedById())
         if !lead.isEmpty {
-            PhoneHero(items: lead, kickers: Self.kickers(for: lead, in: content), height: heroHeight, stretch: overscroll,
-                      open: open, play: play)
+            PhoneHero(items: lead, kickers: Self.kickers(for: lead, in: content), height: heroHeight,
+                      artHeight: PhoneHero.artHeight(forWidth: screenWidth), stretch: overscroll, open: open, play: play)
                 // A new hero source starts the pager over at its first title.
                 .id(lead.map(\.id).joined(separator: "|"))
         }
