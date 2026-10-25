@@ -115,6 +115,8 @@ struct PhoneHero: View {
 private struct PhoneHeroPage: View {
     /// The page's side margin: the mockup's 20, a little wider than the rails below.
     static let margin: CGFloat = 20
+    /// The shape of the sharp picture at the top: a TMDB / Cinemeta backdrop is 16:9, drawn full width.
+    static let artAspect: CGFloat = 16.0 / 9.0
 
     let meta: Meta
     let kicker: String?
@@ -178,7 +180,22 @@ private struct PhoneHeroPage: View {
         ZStack {
             // No backdrop (or none yet): an accent wash instead of a dark hole.
             LinearGradient(colors: [BP.accent.opacity(0.38), BP.surface], startPoint: .top, endPoint: .bottom)
+            // The backdrop is 16:9 and the hero is much taller than that, so filling the hero would show only
+            // a narrow middle slice. Instead: the picture sits at its own shape across the full width, top
+            // aligned (under the status bar), and fades out into a soft blur of itself that carries the colours
+            // down to the text and the canvas.
+            PhoneImage(url: artURL, plate: false, decodeScale: 0.2)
+                .scaleEffect(1.25)
+                .blur(radius: 36)
+                .overlay(Color.black.opacity(0.22))
             PhoneImage(url: artURL, plate: false)
+                .aspectRatio(Self.artAspect, contentMode: .fit)
+                .mask(LinearGradient(stops: [.init(color: .black, location: 0),
+                                             .init(color: .black, location: 0.5),
+                                             .init(color: .black.opacity(0.55), location: 0.78),
+                                             .init(color: .clear, location: 1)],
+                                     startPoint: .top, endPoint: .bottom))
+                .frame(maxHeight: .infinity, alignment: .top)
             // Status bar legibility: a soft scrim from the very top, fading out, not a bar.
             LinearGradient(stops: [.init(color: .black.opacity(0.55), location: 0),
                                    .init(color: .black.opacity(0.22), location: 0.55),
