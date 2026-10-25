@@ -117,6 +117,11 @@ enum PhoneLaunch {
     /// themselves carry none, and no screenshot should wait on the network for it.
     static var heroDemo: Bool { args.contains("--phone-hero-demo") }
 
+    /// `--phone-player-demo` (with `--fixtures`): the player's stand-in engine shows a real backdrop as its
+    /// picture and carries a film's worth of audio and subtitle tracks, so the player can be screenshotted
+    /// as it looks over a picture (PlayerShotTests). The volume starts at 40 %.
+    static var playerDemo: Bool { args.contains("--phone-player-demo") }
+
     /// `--phone-no-resume` (with `--fixtures`): Continue Watching comes back empty for the tab bar's
     /// Resume accessory, so its hidden state can be tested (the fixture feed always has two titles).
     static var noResume: Bool { args.contains("--phone-no-resume") }

@@ -19,7 +19,7 @@ extension PhonePlayerView {
     }
 
     /// Above the scrubber while the HUD is up, near the corner when it is not.
-    private var cueBottom: CGFloat { session.chrome ? 84 : 20 }
+    private var cueBottom: CGFloat { session.chrome ? 104 : 24 }
 
     private func skipPill(_ seg: PlayerSession.SkipSegment) -> some View {
         let outroNext: Bool = session.isOutroNext(seg)

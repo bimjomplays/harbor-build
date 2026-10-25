@@ -60,13 +60,34 @@ final class PhoneFixtureEngine: UIViewController, PlayerEngineControlling {
     private var fill = false
     private var audioDelay: Double = 0
     private var subDelay: Double = 0
+    private var boost = 0
     /// Two audio and two subtitle tracks, as a film's file has: English (5.1) plays, subtitles are off.
-    private var trackList: [MPVPlayerController.Track] = [
+    private var trackList: [MPVPlayerController.Track] = PhoneLaunch.playerDemo ? PhoneFixtureEngine.demoTracks : [
         MPVPlayerController.Track(id: 1, type: "audio", lang: "eng", title: "English", codec: "ac3", selected: true, isDefault: true, channels: "5.1"),
         MPVPlayerController.Track(id: 2, type: "audio", lang: "jpn", title: "Japanese", codec: "aac", selected: false, channels: "2.0"),
         MPVPlayerController.Track(id: 3, type: "sub", lang: "eng", title: "English", codec: "subrip", selected: false, isDefault: true),
         MPVPlayerController.Track(id: 4, type: "sub", lang: "spa", title: "Spanish", codec: "subrip", selected: false),
     ]
+
+    /// `--phone-player-demo`: a release's worth of tracks, as the gear menu's lists look with a real file.
+    /// The first two of each kind keep the ids and roles of the plain fixture's.
+    static let demoTracks: [MPVPlayerController.Track] = [
+        MPVPlayerController.Track(id: 1, type: "audio", lang: "eng", title: "English", codec: "eac3", selected: true, isDefault: true, channels: "5.1(side)"),
+        MPVPlayerController.Track(id: 2, type: "audio", lang: "jpn", title: "Japanese", codec: "eac3", selected: false, channels: "5.1(side)"),
+        MPVPlayerController.Track(id: 5, type: "audio", lang: "eng", title: "Commentary", codec: "aac", selected: false, channels: "stereo"),
+        MPVPlayerController.Track(id: 6, type: "audio", lang: "fre", title: nil, codec: "ac3", selected: false, channels: "5.1(side)"),
+        MPVPlayerController.Track(id: 7, type: "audio", lang: "spa", title: "Latin American", codec: "aac", selected: false, channels: "stereo"),
+        MPVPlayerController.Track(id: 3, type: "sub", lang: "eng", title: "English", codec: "subrip", selected: false, isDefault: true),
+        MPVPlayerController.Track(id: 4, type: "sub", lang: "spa", title: "Spanish", codec: "subrip", selected: false),
+        MPVPlayerController.Track(id: 8, type: "sub", lang: "eng", title: "English SDH", codec: "subrip", selected: false, hearingImpaired: true),
+        MPVPlayerController.Track(id: 9, type: "sub", lang: "eng", title: "Signs & Songs", codec: "ass", selected: false, forced: true),
+        MPVPlayerController.Track(id: 10, type: "sub", lang: "fre", title: nil, codec: "subrip", selected: false),
+        MPVPlayerController.Track(id: 11, type: "sub", lang: "ger", title: nil, codec: "hdmv_pgs_subtitle", selected: false),
+    ]
+
+    /// The demo's picture: a real title's TMDB backdrop (HomeHeroShotTests uses the same one).
+    static let demoPicture = URL(string: "https://image.tmdb.org/t/p/w1280/4NmCfWHzytiKM3riCMcbVYBJhlB.jpg")
+    private let picture = UIImageView()
     private let opened = Date()
     private var lastStep = Date()
     private var timer: Timer?
@@ -82,6 +103,7 @@ final class PhoneFixtureEngine: UIViewController, PlayerEngineControlling {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = UIColor(red: 0.05, green: 0.07, blue: 0.1, alpha: 1)
+        if PhoneLaunch.playerDemo { showPicture() }
         label.translatesAutoresizingMaskIntoConstraints = false
         label.textColor = UIColor.white.withAlphaComponent(0.55)
         label.font = .monospacedDigitSystemFont(ofSize: 13, weight: .medium)
@@ -98,6 +120,28 @@ final class PhoneFixtureEngine: UIViewController, PlayerEngineControlling {
         DispatchQueue.main.async { [weak self] in self?.report("loading") }
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.step() }
         refreshLabel()
+    }
+
+    /// The demo's picture, fitted (or filling, with the pinch) like a film. The label stays readable
+    /// to the tests but out of sight.
+    private func showPicture() {
+        view.backgroundColor = .black
+        picture.frame = view.bounds
+        picture.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        picture.contentMode = .scaleAspectFit
+        picture.clipsToBounds = true
+        picture.isAccessibilityElement = false
+        view.addSubview(picture)
+        label.alpha = 0.02
+        guard let url = Self.demoPicture else { return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data, let image = UIImage(data: data) else { return }
+            DispatchQueue.main.async {
+                self?.picture.image = image
+                self?.picture.accessibilityIdentifier = "player-fixture-picture"
+                self?.picture.isAccessibilityElement = true
+            }
+        }.resume()
     }
 
     func stop() {
@@ -144,6 +188,7 @@ final class PhoneFixtureEngine: UIViewController, PlayerEngineControlling {
         lines.append("sub \(sub)")
         lines.append("rate " + String(format: "%g", rate))
         lines.append("delay " + String(format: "%.1f/%.1f", audioDelay, subDelay))
+        if boost > 0 { lines.append("boost \(boost)") }
         if let subtitles { lines.append(subtitles) }
         lines.append("saved " + (PlayerFixtures.firstSave.map { String(Int($0.rounded())) } ?? "none"))
         let text: String = lines.joined(separator: " · ")
@@ -221,6 +266,12 @@ final class PhoneFixtureEngine: UIViewController, PlayerEngineControlling {
 
     func setPictureFill(_ fill: Bool) {
         self.fill = fill
+        picture.contentMode = fill ? .scaleAspectFill : .scaleAspectFit
+        refreshLabel()
+    }
+
+    func setVolumeBoost(_ percent: Int) {
+        boost = max(0, percent)
         refreshLabel()
     }
 }

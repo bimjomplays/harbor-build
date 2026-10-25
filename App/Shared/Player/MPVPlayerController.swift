@@ -402,6 +402,14 @@ final class MPVPlayerController: UIViewController {
 
     func isMuted() -> Bool { string("mute") == "yes" }
 
+    /// The phone's Volume Boost: mpv plays louder than the file (`volume` above 100, room made with
+    /// `volume-max`); 0 is the file's own level.
+    func setVolumeBoost(_ percent: Int) {
+        let p: Int = max(0, min(300, percent))
+        command("set", ["volume-max", String(max(130, 100 + p))])
+        command("set", ["volume", String(100 + p)])
+    }
+
     /// bp-player-scrub buffered fill: the last timestamp the demuxer holds (demuxer-cache-time).
     func bufferedSec() -> Double { Double(string("demuxer-cache-time") ?? "") ?? 0 }
 

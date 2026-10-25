@@ -63,6 +63,9 @@ protocol PlayerEngineControlling: AnyObject {
     /// going: the picture stops being drawn so the sound can carry on in the background, and is picked
     /// up again at the same spot. The TV never calls it.
     func appBackgrounded(_ on: Bool)
+    /// The phone's Volume Boost: the sound this many percent above the file's own level (mpv only;
+    /// AVPlayer can't go above 100 %, and does nothing). The TV never calls it.
+    func setVolumeBoost(_ percent: Int)
 }
 
 extension MPVPlayerController: PlayerEngineControlling {
@@ -77,6 +80,7 @@ extension MPVPlayerController: PlayerEngineControlling {
 
 extension PlayerEngineControlling {
     func appBackgrounded(_ on: Bool) {}
+    func setVolumeBoost(_ percent: Int) {}
     /// html5 bridge capabilities: no audio offset, no shaders, and a second subtitle only from the
     /// engine's own (sideloaded) tracks. Sync and Look apply to every track on both engines: the
     /// AVPlayer engine draws the file's own tracks too (NativePlayerController, NativeSubtitleOverlay).

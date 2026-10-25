@@ -6,7 +6,8 @@ import XCTest
 /// and two subtitle tracks (3 English, 4 Spanish), and its label (`player-fixture`) reads "fixture <pos> /
 /// 2:00:00 · fit|fill · audio <id|off> · sub <id|off> · rate <n> · delay <audio>/<sub> · … · saved …", so
 /// a change a sheet makes is read back from the engine, and the HUD's buttons read it back from the
-/// session. Under fixtures the HUD holds 30 s after the last touch. The English UI is assumed.
+/// session. The sheets open from the HUD's gear menu (a system menu: its rows are found by their titles).
+/// Under fixtures the HUD holds 30 s after the last touch. The English UI is assumed.
 final class PlayerPanelTests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -132,10 +133,40 @@ final class PlayerPanelTests: XCTestCase {
         expect(app, "player-hud", timeout: 5)
     }
 
-    /// Opens a panel from the HUD: its sheet comes up and the HUD goes behind it.
+    /// A row of the open gear menu whose title starts with `title` (menu rows carry no identifiers).
+    private func menuRow(_ app: XCUIApplication, _ title: String) -> XCUIElement {
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", title)).firstMatch
+    }
+
+    private func tapMenuRow(_ app: XCUIApplication, _ title: String, file: StaticString = #filePath, line: UInt = #line) {
+        let row = menuRow(app, title)
+        if !row.waitForExistence(timeout: 5) {
+            dumpTree(app, "missing-menu-\(title)")
+            snap("missing-menu-\(title)")
+            XCTFail("no menu row \(title)", file: file, line: line)
+            return
+        }
+        row.tap()
+    }
+
+    /// The gear menu's way to each sheet: the audio row's Audio Sync, the subtitle row's Search, Sync &
+    /// Style, the rest under Advanced Options.
+    private func menuPath(_ panel: String) -> [String] {
+        switch panel {
+        case "audio": return ["English - ", "Audio Sync"]
+        case "subtitles": return ["None", "Search, Sync"]
+        case "speed": return ["Advanced Options", "Speed & Sleep"]
+        case "stats": return ["Advanced Options", "Stats"]
+        case "sources": return ["Advanced Options", "Sources"]
+        default: return ["Advanced Options", panel.capitalized]
+        }
+    }
+
+    /// Opens a panel through the HUD's gear menu: its sheet comes up and the HUD goes behind it.
     private func open(_ app: XCUIApplication, _ panel: String) {
         wakeHUD(app)
-        tap(app, "player-panel-\(panel)", timeout: 5)
+        tap(app, "player-gear", timeout: 5)
+        for row in menuPath(panel) { tapMenuRow(app, row) }
         expect(app, "player-sheet-\(panel)", timeout: 10)
         // The sources sheet is the play picker, with its own header.
         if panel != "sources" { expect(app, "player-sheet-title", timeout: 5) }
@@ -158,28 +189,73 @@ final class PlayerPanelTests: XCTestCase {
 
     // MARK: Tests
 
-    /// The HUD has a button for each panel the title gets; a film without a home server or X-Ray has
-    /// no Quality or X-Ray.
-    func testPanelButtons() {
+    /// The HUD is laid out like Infuse's, and its gear menu lists Volume Boost, Playback Speed, the audio
+    /// track, the subtitle (None) and Advanced Options, which holds every panel the title gets; a film
+    /// without a home server or X-Ray has no Quality or X-Ray.
+    func testGearMenu() {
         let app = launch()
         pickFirst(app)
         wakeHUD(app)
-        for panel in ["subtitles", "audio", "speed", "sources", "stats"] {
-            expect(app, "player-panel-\(panel)", timeout: 5)
+        for id in ["player-close", "player-fill", "player-volume", "player-gear", "player-airplay", "player-lock"] {
+            expect(app, id, timeout: 5)
         }
-        expect(app, "player-lock", timeout: 5)
-        XCTAssertFalse(element(app, "player-panel-quality").exists, "a fixture film has no home-server copy")
-        snap("player-panel-buttons")
+        tap(app, "player-gear", timeout: 5)
+        for row in ["Volume Boost", "Playback Speed", "English - AC3 5.1", "None", "Advanced Options"] {
+            XCTAssertTrue(menuRow(app, row).waitForExistence(timeout: 5), "the gear menu has no \(row) row")
+        }
+        snap("player-gear-menu")
+        tapMenuRow(app, "Advanced Options")
+        for row in ["Sleep Timer", "Sources", "Stats", "Speed & Sleep"] {
+            XCTAssertTrue(menuRow(app, row).waitForExistence(timeout: 5), "Advanced Options has no \(row)")
+        }
+        XCTAssertFalse(menuRow(app, "Quality").exists, "a fixture film has no home-server copy")
+        snap("player-gear-advanced")
+        // Away from the menu: a tap outside closes it, and the HUD is still up.
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.5)).tap()
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: menuRow(app, "Sleep Timer"))
+        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 5), .completed, "the gear menu stayed up")
+        expect(app, "player-hud", timeout: 5)
         close(app)
     }
 
-    /// Audio: the track list and sync; a pick plays at once and the sheet stays; the HUD button reads it.
+    /// The gear menu's lists act at once: a speed plays, a boost reaches the engine, a track switches.
+    func testGearMenuLists() {
+        let app = launch()
+        pickFirst(app)
+        expectFixture(app, "audio 1")
+        wakeHUD(app)
+        tap(app, "player-gear", timeout: 5)
+        tapMenuRow(app, "Playback Speed")
+        tapMenuRow(app, "1.5x")
+        expectFixture(app, "rate 1.5")
+        wakeHUD(app)
+        tap(app, "player-gear", timeout: 5)
+        tapMenuRow(app, "Volume Boost")
+        tapMenuRow(app, "+100%")
+        expectFixture(app, "boost 100")
+        wakeHUD(app)
+        tap(app, "player-gear", timeout: 5)
+        tapMenuRow(app, "English - AC3 5.1")
+        tapMenuRow(app, "Japanese - AAC 2.0")
+        expectFixture(app, "audio 2")
+        wakeHUD(app)
+        expectValue(app, "player-gear", "Japanese, Off")
+        tap(app, "player-gear", timeout: 5)
+        tapMenuRow(app, "None")
+        tapMenuRow(app, "Spanish")
+        expectFixture(app, "sub 4")
+        wakeHUD(app)
+        expectValue(app, "player-gear", "Japanese, Spanish")
+        close(app)
+    }
+
+    /// Audio: the track list and sync; a pick plays at once and the sheet stays; the gear reads it.
     func testAudioPanel() {
         let app = launch()
         pickFirst(app)
         expectFixture(app, "audio 1")
         wakeHUD(app)
-        expectValue(app, "player-panel-audio", "English")
+        expectValue(app, "player-gear", "English, Off")
         open(app, "audio")
         snap("player-audio-sheet")
         expect(app, "panel-audio-1")
@@ -191,16 +267,16 @@ final class PlayerPanelTests: XCTestCase {
         expectFixture(app, "delay 0.1/0.0")
         XCTAssertTrue(element(app, "panel-audio-delay-value").label.contains("0.10"), "the offset reads \(element(app, "panel-audio-delay-value").label)")
         dismiss(app, "audio")
-        expectValue(app, "player-panel-audio", "Japanese")
+        expectValue(app, "player-gear", "Japanese, Off")
         close(app)
     }
 
-    /// Subtitles: a track plays, the delay moves, the look lane's size changes; the HUD button reads the track.
+    /// Subtitles: a track plays, the delay moves, the look lane's size changes; the gear reads the track.
     func testSubtitlesPanel() {
         let app = launch()
         pickFirst(app)
         wakeHUD(app)
-        expectValue(app, "player-panel-subtitles", "Off")
+        expectValue(app, "player-gear", "English, Off")
         open(app, "subtitles")
         snap("player-subtitles-sheet")
         tap(app, "panel-subs-track-3")
@@ -217,16 +293,16 @@ final class PlayerPanelTests: XCTestCase {
         tap(app, "panel-subs-lane-tracks")
         tap(app, "panel-subs-off")
         expectFixture(app, "sub off")
-        // The list is the viewer's languages (Spanish is not in it): pick English again and the button reads it.
+        // The list is the viewer's languages (Spanish is not in it): pick English again and the gear reads it.
         tap(app, "panel-subs-track-3")
         expectFixture(app, "sub 3")
         dismiss(app, "subtitles")
-        expectValue(app, "player-panel-subtitles", "English")
+        expectValue(app, "player-gear", "English, English")
         close(app)
     }
 
-    /// Speed: a pick sets the rate and closes the sheet, and the button's face shows it; the sleep timer
-    /// arms from the same sheet and its countdown is on the button; it cancels.
+    /// Speed & Sleep (under Advanced Options): a pick sets the rate and closes the sheet; the sleep timer
+    /// arms from the same sheet, Advanced Options' Sleep Timer row shows its countdown, and it cancels.
     func testSpeedAndSleepPanel() {
         let app = launch()
         pickFirst(app)
@@ -235,27 +311,27 @@ final class PlayerPanelTests: XCTestCase {
         tap(app, "panel-speed-1.5")
         expectGone(app, "player-sheet-speed", timeout: 10)
         expectFixture(app, "rate 1.5")
-        wakeHUD(app)
-        XCTAssertEqual(element(app, "player-panel-speed-face").label, "1.5×")
 
         open(app, "speed")
         tap(app, "panel-sleep-0")
         expect(app, "panel-sleep-cancel", timeout: 5)
         expect(app, "player-sheet-speed", timeout: 2)
         dismiss(app, "speed")
-        // The countdown replaces the rate on the face: "29:5x" / "30:00".
-        let face = expect(app, "player-panel-speed-face", timeout: 5)
-        XCTAssertNotNil(face.label.range(of: #"^\d+:\d\d$"#, options: .regularExpression), "the face reads \(face.label)")
+        // The countdown is on the gear menu's Sleep Timer row.
+        tap(app, "player-gear", timeout: 5)
+        tapMenuRow(app, "Advanced Options")
+        let sleepRow = menuRow(app, "Sleep Timer")
+        XCTAssertTrue(sleepRow.waitForExistence(timeout: 5), "no Sleep Timer row")
+        XCTAssertNotNil(sleepRow.label.range(of: #"\d+:\d\d"#, options: .regularExpression), "the row reads \(sleepRow.label)")
         snap("player-sleep-armed")
+        sleepRow.tap()
+        tapMenuRow(app, "Cancel Timer")
 
         open(app, "speed")
-        tap(app, "panel-sleep-cancel")
         expectGone(app, "panel-sleep-cancel", timeout: 5)
         tap(app, "panel-speed-1")
         expectGone(app, "player-sheet-speed", timeout: 10)
         expectFixture(app, "rate 1 ")
-        wakeHUD(app)
-        expectGone(app, "player-panel-speed-face", timeout: 5)
         close(app)
     }
 

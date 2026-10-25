@@ -166,6 +166,35 @@ jobs:
           name: home-hero-screenshots
           path: hero-shots
           if-no-files-found: ignore
+      - name: Player screenshots
+        # The player laid out like Infuse, in landscape on the 6.9" iPhone, from the UI test that attaches each state
+        # (HUD, paused, gear menu and its lists, brightness, volume, 2x, double tap). Informational, like the hero shots.
+        continue-on-error: true
+        run: |
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devs = [d | {"rt": rt} for rt, ds in json.load(sys.stdin)["devices"].items() if "iOS" in rt for d in ds if d["name"].startswith("iPhone")]
+          devs.sort(key=lambda d: (d["rt"], d["name"] == "iPhone 17 Pro Max", d["name"] == "iPhone 17"))
+          print(devs[-1]["udid"] if devs else "")')
+          test -n "$udid" || exit 1
+          xcrun simctl boot "$udid" || true
+          xcrun simctl bootstatus "$udid" -b
+          set +e
+          xcodebuild -project Harbor.xcodeproj -scheme HarborPhone -destination "id=$udid" \
+            -derivedDataPath build -clonedSourcePackagesDirPath spm -only-testing:HarborPhoneUITests/PlayerShotTests \
+            -resultBundlePath player.xcresult CODE_SIGNING_ALLOWED=NO test-without-building > player.log 2>&1
+          status=$?
+          set -e
+          grep -E "error:|failed|XCTAssert|Executed [0-9]+ tests" player.log | head -30
+          xcrun xcresulttool export attachments --path player.xcresult --output-path player-shots || true
+          ls player-shots | head -40
+          exit $status
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: player-screenshots
+          path: player-shots
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: rust-xcframework
