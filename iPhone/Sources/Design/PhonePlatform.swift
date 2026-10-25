@@ -62,3 +62,17 @@ struct PhoneHooks: PlatformHooks {
     func pipLayerUncovered(for app: AppModel) -> Bool { false }
     func installActivityMonitor() {}
 }
+
+/// The screen's top safe area (status bar and Dynamic Island) and height, read from the key window: Home's
+/// hero runs under the status bar and needs both before it lays out.
+@MainActor
+enum PhoneScreen {
+    private static var window: UIWindow? {
+        let scenes: [UIWindowScene] = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let windows: [UIWindow] = scenes.flatMap { $0.windows }
+        return windows.first(where: { $0.isKeyWindow }) ?? windows.first
+    }
+
+    static var topInset: CGFloat { window?.safeAreaInsets.top ?? 0 }
+    static var height: CGFloat { window?.bounds.height ?? 0 }
+}

@@ -153,6 +153,17 @@ struct PhoneShellView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) { accountButton }
             }
+            // Home draws its own floating buttons over art that runs to the top edge (PhoneHomeView).
+            .toolbar(showsHomeFeed(current) ? .hidden : .automatic, for: .navigationBar)
+        }
+    }
+
+    /// Whether the room is Home's feed (Movies, Shows and Anime are rows on it).
+    private func showsHomeFeed(_ room: Room?) -> Bool {
+        guard let room else { return false }
+        switch room {
+        case .home, .movies, .shows, .anime: return true
+        default: return false
         }
     }
 
@@ -161,7 +172,8 @@ struct PhoneShellView: View {
             switch room {
             case .home, .movies, .shows, .anime:
                 // Movies, Shows and Anime have no screen of their own: their rows are added to Home.
-                PhoneHomeView(app: app, open: { nav.open($0) }, play: { nav.open($0, autoPlay: true) }, resume: resume)
+                PhoneHomeView(app: app, open: { nav.open($0) }, play: { nav.open($0, autoPlay: true) }, resume: resume,
+                              openAccount: { accountOpen = true })
             case .search:
                 PhoneSearchView(views: app.views, open: { nav.open($0, hint: $1) })
             case .discover:

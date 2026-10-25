@@ -6,6 +6,8 @@ import UIKit
 struct PhoneImage: View {
     let url: String?
     var contentMode: ContentMode = .fill
+    /// Where a fitted picture sits inside the frame (a logo that hugs the page's left margin).
+    var alignment: Alignment = .center
     /// The grey plate under the art; off for a logo, which sits straight on the page.
     var plate = true
     /// The share of the drawn pixels to decode (1 = all). Art that is drawn under a heavy blur only needs a
@@ -22,7 +24,7 @@ struct PhoneImage: View {
                     Image(uiImage: image)
                         .resizable()
                         .aspectRatio(contentMode: contentMode)
-                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .frame(width: proxy.size.width, height: proxy.size.height, alignment: alignment)
                         .clipped()
                         .transition(.opacity)
                         .accessibilityHidden(true)

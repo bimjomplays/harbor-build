@@ -112,6 +112,11 @@ enum PhoneLaunch {
     /// Player setting and "Open in…" can be tested on a simulator, which has none of them.
     static var externalPlayers: Bool { args.contains("--phone-external-players") }
 
+    /// `--phone-hero-demo` (with `--fixtures`): the first hero title is dressed as a real one (name, art, logo,
+    /// facts, a "#1" kicker) so the Home hero can be screenshotted as it looks with art. The fixtures
+    /// themselves carry none, and no screenshot should wait on the network for it.
+    static var heroDemo: Bool { args.contains("--phone-hero-demo") }
+
     /// `--phone-no-resume` (with `--fixtures`): Continue Watching comes back empty for the tab bar's
     /// Resume accessory, so its hidden state can be tested (the fixture feed always has two titles).
     static var noResume: Bool { args.contains("--phone-no-resume") }

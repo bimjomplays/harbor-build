@@ -6,7 +6,8 @@
 #                (main pushes and manual runs)
 # Secrets: UPSTREAM_SSH_KEY (read-only deploy key of the private upstream repo), HARBOR_BUNDLE_ID,
 # APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (App Store Connect API key).
-# The repo is public: logs stay in the job output (where secrets are masked), never uploaded as files.
+# The repo is public: logs stay in the job output (where secrets are masked), never uploaded as files. The one upload is
+# the fixture-feed screenshots of the Home hero (nothing personal in them).
 name: build
 on:
   push:
@@ -134,6 +135,36 @@ jobs:
             CODE_SIGNING_ALLOWED=NO test-without-building > test.log 2>&1 \
             || { grep -E "error:|failed|XCTAssert" test.log | head -80; tail -40 test.log; exit 1; }
           grep -E "Executed [0-9]+ tests" test.log | tail -1
+      - name: Home hero screenshots
+        # The Home hero on the fixture feed with real art, from the UI test that attaches them. Informational: a
+        # simulator hiccup here must not hold back the TestFlight upload.
+        continue-on-error: true
+        run: |
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devs = [d | {"rt": rt} for rt, ds in json.load(sys.stdin)["devices"].items() if "iOS" in rt for d in ds if d["name"].startswith("iPhone")]
+          devs.sort(key=lambda d: (d["rt"], d["name"] == "iPhone 17"))
+          print(devs[-1]["udid"] if devs else "")')
+          test -n "$udid" || exit 1
+          xcrun simctl boot "$udid" || true
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl status_bar "$udid" override --time 9:41 --batteryState charged --batteryLevel 100 --cellularBars 4 --wifiBars 3 || true
+          set +e
+          xcodebuild -project Harbor.xcodeproj -scheme HarborPhone -destination "id=$udid" \
+            -derivedDataPath build -clonedSourcePackagesDirPath spm -only-testing:HarborPhoneUITests/HomeHeroShotTests \
+            -resultBundlePath hero.xcresult CODE_SIGNING_ALLOWED=NO test-without-building > hero.log 2>&1
+          status=$?
+          set -e
+          grep -E "error:|failed|XCTAssert|Executed [0-9]+ tests" hero.log | head -30
+          xcrun xcresulttool export attachments --path hero.xcresult --output-path hero-shots || true
+          ls hero-shots | head -20
+          exit $status
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: home-hero-screenshots
+          path: hero-shots
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: rust-xcframework

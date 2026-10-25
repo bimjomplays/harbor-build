@@ -1,12 +1,25 @@
 import SwiftUI
 
-/// The Home hero: the lead titles as full-width pages, each with its logo
-/// (or its name), a facts line and Play + Watchlist glass buttons, and dots under the art. Tapping the
-/// art opens the title. It cycles by itself, as the TV's hero does, and stops while a finger is on it.
+/// The Home hero ("Spotlight"): the lead titles as full-width pages whose art runs to the very top of the
+/// screen, under the status bar. Each page has a kicker (only when the title really ranks somewhere), its
+/// logo (or its name), a facts line, a Play pill with a Watchlist and a Details circle, and dots under it
+/// all. Tapping the art opens the title. It cycles by itself, as the TV's hero does, and stops while a
+/// finger is on it.
+///
+/// The hero is `height` tall counting from the screen's top edge: Home shifts it up by the top safe area
+/// (PhoneHomeView), so the art starts at y = 0 and everything below is laid out as if it began there.
 struct PhoneHero: View {
-    static let height: CGFloat = 500
+    /// The hero's share of the screen's height, and the least and most it takes (points).
+    static func height(forScreen screen: CGFloat) -> CGFloat { min(720, max(540, screen * 0.68)) }
 
     let items: [Meta]
+    /// "#1 in Top 10 Today" and the like, by title id: only titles that really rank get one.
+    var kickers: [String: String] = [:]
+    /// The hero's height from the top edge of the screen.
+    let height: CGFloat
+    /// How far the feed is pulled down past its top (pull to refresh, rubber banding): the art grows to
+    /// fill it, so no gap opens above the hero.
+    var stretch: CGFloat = 0
     /// Opens the title page.
     let open: (Meta) -> Void
     /// Play: the title page, which opens the picker (and the player) as soon as it knows what to play.
@@ -22,17 +35,19 @@ struct PhoneHero: View {
     private var currentId: String { current ?? items.first?.id ?? "" }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack(alignment: .bottomLeading) {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(spacing: 0) {
                     ForEach(items) { meta in
-                        PhoneHeroPage(meta: meta, open: open, play: play)
+                        PhoneHeroPage(meta: meta, kicker: kickers[meta.id], height: height, stretch: stretch, open: open, play: play)
                             .containerRelativeFrame(.horizontal)
                             .id(meta.id)
                     }
                 }
                 .scrollTargetLayout()
             }
+            // The art grows upward when the feed is pulled down; the pager must not cut that off.
+            .scrollClipDisabled()
             .scrollTargetBehavior(.paging)
             .scrollPosition(id: $current)
             // The pager's own scroll phase, not a DragGesture: a drag gesture on the pager competed with
@@ -45,16 +60,18 @@ struct PhoneHero: View {
                 HStack(spacing: 6) {
                     ForEach(items) { meta in
                         Capsule()
-                            .fill(meta.id == currentId ? BP.ink : BP.ink.opacity(0.3))
-                            .frame(width: meta.id == currentId ? 16 : 6, height: 6)
+                            .fill(meta.id == currentId ? BP.accent : BP.ink.opacity(0.32))
+                            .frame(width: meta.id == currentId ? 22 : 6, height: 6)
                     }
                 }
-                .padding(.bottom, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, PhoneHeroPage.margin)
+                .padding(.bottom, 22)
                 .motion(.easeOut(duration: 0.2), value: currentId)
                 .accessibilityHidden(true)
             }
         }
-        .frame(height: Self.height)
+        .frame(height: height)
         .onScrollVisibilityChange(threshold: 0.2) { visible = $0 }
         .task(id: CycleKey(ids: items.map(\.id), still: reduceMotion || voiceOver)) { await cycle() }
         .accessibilityElement(children: .contain)
@@ -96,7 +113,13 @@ struct PhoneHero: View {
 }
 
 private struct PhoneHeroPage: View {
+    /// The page's side margin: the mockup's 20, a little wider than the rails below.
+    static let margin: CGFloat = 20
+
     let meta: Meta
+    let kicker: String?
+    let height: CGFloat
+    let stretch: CGFloat
     let open: (Meta) -> Void
     let play: (Meta) -> Void
 
@@ -107,69 +130,84 @@ private struct PhoneHeroPage: View {
 
     private var saved: Bool { actions.isSaved(meta, marks: marks.byId[meta.id]) }
     private var logoURL: String? { meta.logo ?? resolvedLogo }
+    private var artURL: String? { meta.background ?? meta.poster }
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            Button { open(meta) } label: {
-                ZStack {
-                    PhoneImage(url: meta.background ?? meta.poster)
-                    LinearGradient(colors: [.clear, BP.canvas.opacity(0.35), BP.canvas],
-                                   startPoint: .center, endPoint: .bottom)
-                }
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(Text(verbatim: meta.name))
-            .accessibilityHint(Text(T("Opens the title")))
-            .accessibilityIdentifier("hero-open-\(meta.id)")
-            VStack(alignment: .leading, spacing: 10) {
-                title
-                if !meta.facts.isEmpty {
-                    Text(verbatim: meta.facts)
-                        .font(PhoneTheme.sans(14, .medium, relativeTo: .subheadline))
-                        .foregroundStyle(BP.inkMuted)
-                        .lines(1)
-                }
-                GlassEffectContainer(spacing: 12) {
-                    HStack(spacing: 12) {
-                        Button {
-                            PhoneFeedback.shared.tap()
-                            play(meta)
-                        } label: {
-                            Label(T("Play"), systemImage: "play.fill")
-                                .font(PhoneTheme.sans(16, .semibold, relativeTo: .body))
-                                .padding(.horizontal, 8)
-                        }
-                        .buttonStyle(.glassProminent)
-                        .accessibilityIdentifier("hero-play-\(meta.id)")
-                        Button {
-                            PhoneFeedback.shared.tap()
-                            let current = saved
-                            let title = meta
-                            Task { await PhoneTitleActions.shared.toggleSaved(title, current: current) }
-                        } label: {
-                            Label(saved ? T("Saved") : T("Watchlist"), systemImage: saved ? "checkmark" : "plus")
-                                .font(PhoneTheme.sans(16, .semibold, relativeTo: .body))
-                                .padding(.horizontal, 8)
-                        }
-                        .buttonStyle(.glass)
-                        .accessibilityIdentifier("hero-watchlist-\(meta.id)")
+            Button { open(meta) } label: { art }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Text(verbatim: meta.name))
+                .accessibilityHint(Text(T("Opens the title")))
+                .accessibilityIdentifier("hero-open-\(meta.id)")
+            VStack(alignment: .leading, spacing: 0) {
+                if let kicker, !kicker.isEmpty {
+                    HStack(spacing: 7) {
+                        Image(systemName: "chart.line.uptrend.xyaxis")
+                            .font(.system(size: 12, weight: .bold))
+                        Text(verbatim: kicker.uppercased())
+                            .font(PhoneTheme.sans(12.5, .semibold, relativeTo: .caption))
+                            .tracking(2.2)
+                            .lines(1)
                     }
+                    .foregroundStyle(BP.accent)
+                    .shadow(color: .black.opacity(0.5), radius: 6)
+                    .padding(.bottom, 14)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("hero-kicker-\(meta.id)")
                 }
+                title
+                PhoneHeroFacts(meta: meta)
+                    .padding(.top, 16)
+                actionRow
+                    .padding(.top, 22)
             }
-            .padding(.horizontal, PhoneTheme.margin)
-            .padding(.bottom, 34)
+            .padding(.horizontal, Self.margin)
+            // Room for the dots PhoneHero draws under everything.
+            .padding(.bottom, 52)
         }
-        .frame(height: PhoneHero.height)
+        .frame(height: height)
         .task(id: meta.id) {
             await resolveLogo()
             await PhoneTitleActions.shared.loadSaved(meta)
         }
     }
 
+    /// The art with its scrims, edge to edge. Pulled past the top, it grows from its bottom edge so the
+    /// top stays glued to the screen's.
+    private var art: some View {
+        ZStack {
+            // No backdrop (or none yet): an accent wash instead of a dark hole.
+            LinearGradient(colors: [BP.accent.opacity(0.38), BP.surface], startPoint: .top, endPoint: .bottom)
+            PhoneImage(url: artURL, plate: false)
+            // Status bar legibility: a soft scrim from the very top, fading out, not a bar.
+            LinearGradient(stops: [.init(color: .black.opacity(0.55), location: 0),
+                                   .init(color: .black.opacity(0.22), location: 0.55),
+                                   .init(color: .clear, location: 1)],
+                           startPoint: .top, endPoint: .bottom)
+                .frame(height: 190)
+                .frame(maxHeight: .infinity, alignment: .top)
+            // The left side darkens under the text.
+            LinearGradient(colors: [BP.canvas.opacity(0.55), BP.canvas.opacity(0)], startPoint: .leading, endPoint: UnitPoint(x: 0.7, y: 0.5))
+                .mask(LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: UnitPoint(x: 0.5, y: 0.35)))
+                .frame(height: height * 0.5)
+                .frame(maxHeight: .infinity, alignment: .bottom)
+            // Into the canvas at the bottom.
+            LinearGradient(stops: [.init(color: BP.canvas.opacity(0), location: 0.38),
+                                   .init(color: BP.canvas.opacity(0.5), location: 0.56),
+                                   .init(color: BP.canvas.opacity(0.88), location: 0.76),
+                                   .init(color: BP.canvas, location: 0.98)],
+                           startPoint: .top, endPoint: .bottom)
+        }
+        .frame(height: height)
+        .clipped()
+        .scaleEffect(1 + stretch / max(1, height), anchor: .bottom)
+    }
+
     @ViewBuilder private var title: some View {
         if let logoURL {
-            PhoneImage(url: logoURL, contentMode: .fit, plate: false)
-                .frame(width: 220, height: 84, alignment: .leading)
+            PhoneImage(url: logoURL, contentMode: .fit, alignment: .leading, plate: false)
+                .frame(width: 268, height: 80, alignment: .leading)
+                .shadow(color: .black.opacity(0.35), radius: 10, y: 3)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(Text(verbatim: meta.name))
                 .accessibilityAddTraits(.isHeader)
@@ -177,8 +215,64 @@ private struct PhoneHeroPage: View {
             Text(verbatim: meta.name)
                 .font(PhoneTheme.display(34, .semibold, relativeTo: .largeTitle))
                 .foregroundStyle(BP.ink)
+                .shadow(color: .black.opacity(0.4), radius: 8, y: 2)
                 .lines(2)
                 .accessibilityAddTraits(.isHeader)
+        }
+    }
+
+    /// Play as a wide pill, then Watchlist and Details as glass circles.
+    private var actionRow: some View {
+        HStack(spacing: 12) {
+            Button {
+                PhoneFeedback.shared.tap()
+                play(meta)
+            } label: {
+                HStack(spacing: 9) {
+                    Image(systemName: "play.fill").font(.system(size: 17, weight: .semibold))
+                    Text(T("Play")).font(PhoneTheme.sans(18, .semibold, relativeTo: .body))
+                }
+                .foregroundStyle(BP.canvas)
+                .frame(maxWidth: .infinity)
+                .frame(height: 54)
+                .background(Capsule().fill(BP.ink))
+                .shadow(color: .black.opacity(0.3), radius: 11, y: 4)
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("hero-play-\(meta.id)")
+            GlassEffectContainer(spacing: 12) {
+                HStack(spacing: 12) {
+                    Button {
+                        PhoneFeedback.shared.tap()
+                        let current = saved
+                        let title = meta
+                        Task { await PhoneTitleActions.shared.toggleSaved(title, current: current) }
+                    } label: {
+                        Image(systemName: saved ? "checkmark" : "plus")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundStyle(BP.ink)
+                            .frame(width: 54, height: 54)
+                            .glassEffect(.regular.interactive(), in: .circle)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(Text(saved ? T("Saved") : T("Watchlist")))
+                    .accessibilityIdentifier("hero-watchlist-\(meta.id)")
+                    Button {
+                        PhoneFeedback.shared.tap()
+                        open(meta)
+                    } label: {
+                        Image(systemName: "info")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundStyle(BP.ink)
+                            .frame(width: 54, height: 54)
+                            .glassEffect(.regular.interactive(), in: .circle)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(Text(T("Details")))
+                    .accessibilityIdentifier("hero-details-\(meta.id)")
+                }
+            }
         }
     }
 
@@ -188,5 +282,56 @@ private struct PhoneHeroPage: View {
         let answer: String?? = try? await HarborEngine.shared.call("titleLogo.resolve", [meta, p?.id ?? "default", p?.linked ?? true])
         guard !Task.isCancelled, let found = answer, let url = found, !url.isEmpty else { return }
         resolvedLogo = url
+    }
+}
+
+/// "2022  IMDb 8.3  Animation · Sci-Fi": only the parts the title has; nothing at all when it has none.
+private struct PhoneHeroFacts: View {
+    let meta: Meta
+
+    private var year: String? { Self.text(meta.releaseInfo) }
+    private var rating: String? { Self.text(meta.imdbRating) }
+    private var runtime: String? { meta.type == "movie" ? Self.text(meta.runtime) : nil }
+    private var genres: String? {
+        let names: [String] = (meta.genres ?? []).filter { !$0.isEmpty }.prefix(2).map { $0 }
+        return names.isEmpty ? nil : names.joined(separator: " · ")
+    }
+
+    private static func text(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        return value
+    }
+
+    var body: some View {
+        if year != nil || rating != nil || runtime != nil || genres != nil {
+            HStack(spacing: 8) {
+                if let year { Text(verbatim: year) }
+                if let rating {
+                    HStack(spacing: 6) {
+                        Text(verbatim: "IMDb")
+                            .font(PhoneTheme.sans(10.5, .bold, relativeTo: .caption2))
+                            .foregroundStyle(Color.black)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 3)
+                            .background(RoundedRectangle(cornerRadius: 4, style: .continuous).fill(Color(hex: 0xf5c518)))
+                        Text(verbatim: rating)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(BP.ink)
+                    }
+                }
+                if let runtime { Text(verbatim: runtime) }
+                if let genres {
+                    Text(verbatim: genres)
+                        .lines(1)
+                        .minimumScaleFactor(0.85)
+                }
+            }
+            .font(PhoneTheme.sans(14.5, .medium, relativeTo: .subheadline))
+            .foregroundStyle(Color(hex: 0xc9cbcd))
+            .shadow(color: .black.opacity(0.5), radius: 6)
+            .lineLimit(1)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(verbatim: meta.facts))
+        }
     }
 }
