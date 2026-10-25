@@ -12,11 +12,11 @@ import SwiftUI
 /// art's lower part down onto the canvas under it.
 struct PhoneHero: View {
     /// The art band's height for a screen `width` points wide (its short side). A backdrop is 16:9, so at the
-    /// screen's width it is 0.5625x as tall as wide; the band is 0.68x, a little taller so it also covers the
-    /// status bar, and aspect-filling the backdrop into it crops only its sides: 83% of the picture's width
-    /// shows (440 x 299 pt on a 6.9" iPhone). The old hero drew the art over the whole 535 pt hero, which showed
+    /// screen's width it is 0.5625x as tall as wide; the band is 0.80x, a little taller so it also covers the
+    /// status bar, and aspect-filling the backdrop into it crops its sides: about 70% of the picture's width
+    /// shows (440 x 352 pt on a 6.9" iPhone). The old hero drew the art over the whole 535 pt hero, which showed
     /// 46%: a narrow, zoomed middle slice.
-    static func artHeight(forWidth width: CGFloat) -> CGFloat { (max(320, width) * 0.68).rounded() }
+    static func artHeight(forWidth width: CGFloat) -> CGFloat { (max(320, width) * 0.80).rounded() }
 
     /// The hero's height: the art band and the text block's part below it (the facts, the buttons, the dots).
     /// The kicker and the logo sit over the art's lower part.

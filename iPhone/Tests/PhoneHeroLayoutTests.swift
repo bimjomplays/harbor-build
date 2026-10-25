@@ -1,7 +1,7 @@
 import XCTest
 @testable import HarborPhone
 
-/// Home's hero shows most of a landscape backdrop: the art band is close to the picture's own 16:9 shape, so
+/// Home's hero shows about 70% of a landscape backdrop: the art band is close to the picture's own 16:9 shape, so
 /// aspect-filling it crops only a little off the sides, on every iPhone width.
 @MainActor
 final class PhoneHeroLayoutTests: XCTestCase {
@@ -11,7 +11,7 @@ final class PhoneHeroLayoutTests: XCTestCase {
     func testArtShowsMostOfA16x9Backdrop() {
         for width in widths {
             let share = PhoneHero.visibleShare(aspect: 16.0 / 9.0, width: width)
-            XCTAssertGreaterThanOrEqual(share, 0.8, "at \(width) pt only \(share) of the backdrop's width shows")
+            XCTAssertEqual(share, 0.70, accuracy: 0.03, "at \(width) pt only \(share) of the backdrop's width shows")
         }
     }
 
@@ -23,8 +23,8 @@ final class PhoneHeroLayoutTests: XCTestCase {
     }
 
     func testSixPointNineInchNumbers() {
-        XCTAssertEqual(PhoneHero.artHeight(forWidth: 440), 299)
-        XCTAssertEqual(PhoneHero.height(forWidth: 440), 451)
+        XCTAssertEqual(PhoneHero.artHeight(forWidth: 440), 352)
+        XCTAssertEqual(PhoneHero.height(forWidth: 440), 504)
     }
 
     func testTextBlockOverlapsTheArt() {
