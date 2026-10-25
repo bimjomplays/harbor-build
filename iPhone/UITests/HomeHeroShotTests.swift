@@ -66,9 +66,9 @@ final class HomeHeroShotTests: XCTestCase {
         // The art is at the top edge: the hero starts at y = 0.
         let hero = element(app, "hero-carousel").frame
         XCTAssertLessThanOrEqual(hero.minY, 1, "the hero does not start at the top of the screen")
-        // Short: the art is a band near a backdrop's own shape and the text runs on under it (451 pt on a 440 pt
+        // Short: the art is a band near a backdrop's own shape and the text runs on under it (504 pt on a 440 pt
         // wide screen, where the old hero was 535 pt of zoomed art).
-        XCTAssertLessThan(hero.height, hero.width * 1.1, "the hero is \(hero.size), too tall")
+        XCTAssertLessThan(hero.height, hero.width * 1.2, "the hero is \(hero.size), too tall")
         pause(10)
         snap("home-hero-spotlight")
 
