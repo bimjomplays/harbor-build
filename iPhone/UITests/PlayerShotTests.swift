@@ -10,7 +10,8 @@ import XCTest
 /// (the shots wait for it, and are still taken without it).
 final class PlayerShotTests: XCTestCase {
     override func setUpWithError() throws {
-        continueAfterFailure = false
+        // Every state is still shot when one goes wrong.
+        continueAfterFailure = true
     }
 
     override func tearDownWithError() throws {
@@ -88,12 +89,24 @@ final class PlayerShotTests: XCTestCase {
         _ = XCTWaiter.wait(for: [gone], timeout: 5)
     }
 
-    /// Opens the gear menu, then the list under `row` (none for the menu itself), and shoots it.
-    private func shootMenu(_ app: XCUIApplication, _ row: String?, _ name: String) {
+    /// Opens the gear menu, then the list under `row` (none for the menu itself) until its own row `inner`
+    /// shows, and shoots it.
+    private func shootMenu(_ app: XCUIApplication, _ row: String?, inner: String? = nil, _ name: String) {
         wakeHUD(app)
         tap(app, "player-gear", timeout: 5)
         XCTAssertTrue(menuRow(app, "Advanced Options").waitForExistence(timeout: 5), "the gear menu did not open")
-        if let row { tapMenuRow(app, row) }
+        if let row {
+            pause(0.6)
+            tapMenuRow(app, row)
+            if let inner, !menuRow(app, inner).waitForExistence(timeout: 3) {
+                let tree = XCTAttachment(string: app.debugDescription)
+                tree.name = "hierarchy-\(name)"
+                tree.lifetime = .keepAlways
+                add(tree)
+                tapMenuRow(app, row)
+                XCTAssertTrue(menuRow(app, inner).waitForExistence(timeout: 3), "the \(row) list did not open")
+            }
+        }
         pause(1.2)
         snap(name)
         // A tap away closes the menu; the HUD stays.
@@ -133,11 +146,11 @@ final class PlayerShotTests: XCTestCase {
 
         // The gear menu and each of its lists.
         shootMenu(app, nil, "03-gear-menu")
-        shootMenu(app, "Volume Boost", "04-gear-volume-boost")
-        shootMenu(app, "Playback Speed", "05-gear-playback-speed")
-        shootMenu(app, "English - E-AC3 5.1", "06-gear-audio")
-        shootMenu(app, "None", "07-gear-subtitles")
-        shootMenu(app, "Advanced Options", "08-gear-advanced")
+        shootMenu(app, "Volume Boost", inner: "Disabled", "04-gear-volume-boost")
+        shootMenu(app, "Playback Speed", inner: "Set as Default Speed", "05-gear-playback-speed")
+        shootMenu(app, "English - E-AC3 5.1", inner: "Audio Sync", "06-gear-audio")
+        shootMenu(app, "None", inner: "Search, Sync", "07-gear-subtitles")
+        shootMenu(app, "Advanced Options", inner: "Sleep Timer", "08-gear-advanced")
 
         // Playing again, the HUD away: a swipe up on the left half shows the brightness pill.
         wakeHUD(app)

@@ -26,6 +26,9 @@ struct PhonePlayerGearButton: UIViewRepresentable {
         b.preferredMenuElementOrder = .fixed
         b.accessibilityIdentifier = "player-gear"
         b.setContentHuggingPriority(.required, for: .horizontal)
+        // Set once: UIKit redraws a menu that is showing when `menu` is replaced, which would fold an
+        // open list back to the top on every SwiftUI update. The rows come from `items` at each open.
+        b.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak b] done in done(b?.items() ?? []) }])
         update(b)
         return b
     }
@@ -36,12 +39,12 @@ struct PhonePlayerGearButton: UIViewRepresentable {
         b.onOpen = onOpen
         b.accessibilityLabel = label
         b.accessibilityValue = value
-        let items = self.items
-        b.menu = UIMenu(children: [UIDeferredMenuElement.uncached { done in done(items()) }])
+        b.items = items
     }
 
     final class GearButton: UIButton {
         var onOpen: (Bool) -> Void = { _ in }
+        var items: () -> [UIMenuElement] = { [] }
 
         override func contextMenuInteraction(_ interaction: UIContextMenuInteraction, willDisplayMenuFor configuration: UIContextMenuConfiguration,
                                              animator: (any UIContextMenuInteractionAnimating)?) {
