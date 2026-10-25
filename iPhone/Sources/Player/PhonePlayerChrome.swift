@@ -33,13 +33,13 @@ extension PhonePlayerView {
                            startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
-            transport
+            PhonePlayerTransport(player: self)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea()
             VStack(spacing: 0) {
-                topRow
+                PhonePlayerTopRow(player: self)
                 Spacer(minLength: 0)
-                bottomBlock
+                PhonePlayerBottomBlock(player: self)
             }
             .padding(.horizontal, Metrics.side)
             .padding(.top, Metrics.top)
@@ -52,7 +52,7 @@ extension PhonePlayerView {
 
     // MARK: top
 
-    private var topRow: some View {
+    fileprivate var topRow: some View {
         HStack(alignment: .center, spacing: 9) {
             Button { hudPress { session.requestClose() } } label: {
                 Image(systemName: "xmark")
@@ -75,7 +75,7 @@ extension PhonePlayerView {
             .padding(.horizontal, 2)
             .glassEffect(.clear.interactive(), in: .capsule)
             Spacer(minLength: 12)
-            volumeCapsule
+            PhonePlayerVolumeCapsule(player: self)
         }
     }
 
@@ -84,7 +84,7 @@ extension PhonePlayerView {
         VStack {
             HStack {
                 Spacer()
-                volumeCapsule
+                PhonePlayerVolumeCapsule(player: self)
             }
             Spacer()
         }
@@ -95,7 +95,6 @@ extension PhonePlayerView {
     /// "40%", the level's bar and a speaker: a finger on the bar sets the phone's volume.
     var volumeCapsule: some View {
         let level: Double = volume.level
-        let filled: CGFloat = CGFloat(min(1, max(0, level)))
         return HStack(spacing: 10) {
             Text(verbatim: PhonePlayerTouch.percent(level))
                 .font(.system(size: 18, weight: .regular))
@@ -103,28 +102,7 @@ extension PhonePlayerView {
                 .foregroundStyle(Color.white.opacity(0.92))
                 .frame(width: 46, alignment: .leading)
                 .accessibilityIdentifier("player-volume-value")
-            GeometryReader { g in
-                let w: CGFloat = g.size.width
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.28)).frame(height: 4)
-                    Capsule().fill(Color.white).frame(width: max(4, w * filled), height: 4)
-                    Circle().fill(Color.white).frame(width: 11, height: 11)
-                        .shadow(color: Color.black.opacity(0.25), radius: 2)
-                        .position(x: min(max(5.5, w * filled), w - 5.5), y: g.size.height / 2)
-                }
-                .frame(maxHeight: .infinity)
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { v in
-                            session.hideTask?.cancel()
-                            volume.set(Double(v.location.x / max(1, w)))
-                        }
-                        .onEnded { _ in session.wake() }
-                )
-            }
-            .frame(width: 108, height: Metrics.control)
-            .environment(\.layoutDirection, .leftToRight)
+            PhonePlayerVolumeBar(player: self)
             Image(systemName: PhonePlayerTouch.speakerGlyph(level))
                 .font(.system(size: 17, weight: .regular))
                 .foregroundStyle(Color.white.opacity(0.75))
@@ -148,6 +126,33 @@ extension PhonePlayerView {
         .accessibilityIdentifier("player-volume")
     }
 
+    /// The volume capsule's bar: a finger on it sets the phone's volume.
+    fileprivate var volumeBar: some View {
+        let filled: CGFloat = CGFloat(min(1, max(0, volume.level)))
+        return GeometryReader { g in
+            let w: CGFloat = g.size.width
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.28)).frame(height: 4)
+                Capsule().fill(Color.white).frame(width: max(4, w * filled), height: 4)
+                Circle().fill(Color.white).frame(width: 11, height: 11)
+                    .shadow(color: Color.black.opacity(0.25), radius: 2)
+                    .position(x: min(max(5.5, w * filled), w - 5.5), y: g.size.height / 2)
+            }
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        session.hideTask?.cancel()
+                        volume.set(Double(v.location.x / max(1, w)))
+                    }
+                    .onEnded { _ in session.wake() }
+            )
+        }
+        .frame(width: 108, height: Metrics.control)
+        .environment(\.layoutDirection, .leftToRight)
+    }
+
     // MARK: middle
 
     /// Back, play / pause and ahead: plain white icons, no plates.
@@ -164,23 +169,13 @@ extension PhonePlayerView {
         }
     }
 
-    private func plainIcon(_ id: String, _ icon: String, label: String, size: CGFloat, action: @escaping () -> Void) -> some View {
-        Button { hudPress(action) } label: {
-            Image(systemName: icon)
-                .font(.system(size: size, weight: .regular))
-                .foregroundStyle(Color.white)
-                .shadow(color: Color.black.opacity(0.35), radius: 6)
-                .frame(width: Metrics.transportGap, height: 72)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(Text(label))
-        .accessibilityIdentifier(id)
+    private func plainIcon(_ id: String, _ icon: String, label: String, size: CGFloat, action: @escaping () -> Void) -> PhonePlainIcon {
+        PhonePlainIcon(id: id, icon: icon, label: label, size: size, press: { hudPress(action) })
     }
 
     // MARK: foot
 
-    private var bottomBlock: some View {
+    fileprivate var bottomBlock: some View {
         VStack(spacing: 0) {
             HStack(alignment: .center, spacing: 16) {
                 titleLine
@@ -189,7 +184,7 @@ extension PhonePlayerView {
             }
             .frame(height: Metrics.control)
             if !session.isLive {
-                PlayerClockReader(session.clock) { c in scrubber(c) }
+                PlayerClockReader(session.clock) { c in PhonePlayerScrubber(player: self, clock: c) }
                     .padding(.top, 6.5)
             }
         }
@@ -242,17 +237,8 @@ extension PhonePlayerView {
     }
 
     /// An icon in a glass capsule.
-    private func capsuleIcon(_ id: String, _ icon: String, label: String, size: CGFloat, action: @escaping () -> Void) -> some View {
-        Button { hudPress(action) } label: {
-            Image(systemName: icon)
-                .font(.system(size: size, weight: .regular))
-                .foregroundStyle(Color.white)
-                .frame(width: 43, height: Metrics.control)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(Text(label))
-        .accessibilityIdentifier(id)
+    private func capsuleIcon(_ id: String, _ icon: String, label: String, size: CGFloat, action: @escaping () -> Void) -> PhoneCapsuleIcon {
+        PhoneCapsuleIcon(id: id, icon: icon, label: label, size: size, press: { hudPress(action) })
     }
 
     /// Any HUD press restarts the HUD's wait.
@@ -277,58 +263,29 @@ extension PhonePlayerView {
         let dragging: Bool = scrubbing != nil
         let bar: CGFloat = dragging ? 8 : 5
         return VStack(spacing: 0) {
-            GeometryReader { g in
-                let w: CGFloat = g.size.width
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.24)).frame(height: bar)
-                    Capsule().fill(Color.white.opacity(0.5)).frame(width: max(bar, w * buffered), height: bar)
-                    Capsule().fill(Color.white).frame(width: max(bar, w * played), height: bar)
+            PhonePlayerScrubTrack(player: self, duration: duration, played: played, buffered: buffered, bar: bar, dragging: dragging)
+                .frame(height: 20)
+                .accessibilityElement()
+                .accessibilityLabel(Text(T("Seek")))
+                .accessibilityValue(Text(verbatim: PlayerClock.fmt(shown)))
+                .accessibilityAdjustableAction { direction in
+                    switch direction {
+                    case .increment: step(ahead: true)
+                    case .decrement: step(ahead: false)
+                    @unknown default: break
+                    }
+                }
+                .accessibilityIdentifier("player-scrubber")
+                // Over the finger: the preview frame with the time (PhoneScrubPlate), or the time alone. Outside
+                // the bar's own accessibility element, so the tests see it.
+                .overlay {
                     if dragging {
-                        Circle().fill(Color.white)
-                            .frame(width: 16, height: 16)
-                            .shadow(color: Color.black.opacity(0.35), radius: 3, y: 1)
-                            .position(x: w * played, y: g.size.height / 2)
+                        GeometryReader { g in
+                            PhoneScrubPlate(preview: preview, time: shown, x: g.size.width * played, width: g.size.width)
+                        }
+                        .allowsHitTesting(false)
                     }
                 }
-                .frame(maxHeight: .infinity)
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { v in
-                            guard let t = PhonePlayerHUD.scrubTarget(x: v.location.x, width: w, duration: duration) else { return }
-                            session.seekCommit?.cancel()
-                            session.hideTask?.cancel()
-                            session.pendingSeek = t
-                        }
-                        .onEnded { _ in
-                            if session.pendingSeek != nil { session.commitSeek(after: 0) }
-                            session.wake()
-                        }
-                )
-                .motion(.easeOut(duration: 0.15), value: dragging)
-            }
-            .frame(height: 20)
-            .accessibilityElement()
-            .accessibilityLabel(Text(T("Seek")))
-            .accessibilityValue(Text(verbatim: PlayerClock.fmt(shown)))
-            .accessibilityAdjustableAction { direction in
-                switch direction {
-                case .increment: step(ahead: true)
-                case .decrement: step(ahead: false)
-                @unknown default: break
-                }
-            }
-            .accessibilityIdentifier("player-scrubber")
-            // Over the finger: the preview frame with the time (PhoneScrubPlate), or the time alone. Outside
-            // the bar's own accessibility element, so the tests see it.
-            .overlay {
-                if dragging {
-                    GeometryReader { g in
-                        PhoneScrubPlate(preview: preview, time: shown, x: g.size.width * played, width: g.size.width)
-                    }
-                    .allowsHitTesting(false)
-                }
-            }
             HStack {
                 Text(verbatim: labels.elapsed).accessibilityIdentifier("player-elapsed")
                 Spacer()
@@ -343,6 +300,41 @@ extension PhonePlayerView {
         .environment(\.layoutDirection, .leftToRight)
     }
 
+    /// The scrubber's bar (played over buffered, the knob while dragging): a finger on it moves the
+    /// pending spot.
+    fileprivate func scrubTrack(duration: Double, played: CGFloat, buffered: CGFloat, bar: CGFloat, dragging: Bool) -> some View {
+        GeometryReader { g in
+            let w: CGFloat = g.size.width
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.24)).frame(height: bar)
+                Capsule().fill(Color.white.opacity(0.5)).frame(width: max(bar, w * buffered), height: bar)
+                Capsule().fill(Color.white).frame(width: max(bar, w * played), height: bar)
+                if dragging {
+                    Circle().fill(Color.white)
+                        .frame(width: 16, height: 16)
+                        .shadow(color: Color.black.opacity(0.35), radius: 3, y: 1)
+                        .position(x: w * played, y: g.size.height / 2)
+                }
+            }
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        guard let t = PhonePlayerHUD.scrubTarget(x: v.location.x, width: w, duration: duration) else { return }
+                        session.seekCommit?.cancel()
+                        session.hideTask?.cancel()
+                        session.pendingSeek = t
+                    }
+                    .onEnded { _ in
+                        if session.pendingSeek != nil { session.commitSeek(after: 0) }
+                        session.wake()
+                    }
+            )
+            .motion(.easeOut(duration: 0.15), value: dragging)
+        }
+    }
+
     // MARK: the pills
 
     /// Top centre: the brightness while a left-half swipe moves it, "2x" while a press and hold plays fast.
@@ -350,41 +342,172 @@ extension PhonePlayerView {
         VStack {
             HStack(spacing: 10) {
                 if levelShown == .brightness {
-                    HStack(spacing: 22) {
-                        Image(systemName: "sun.max").font(.system(size: 25, weight: .regular)).accessibilityHidden(true)
-                        Text(verbatim: PhonePlayerTouch.percent(brightness.level))
-                            .font(.system(size: 15, weight: .medium)).monospacedDigit()
-                            .frame(minWidth: 38, alignment: .leading)
-                    }
-                    .foregroundStyle(Color.white)
-                    .padding(.horizontal, 24)
-                    .frame(height: 46)
-                    .glassEffect(.regular, in: .capsule)
-                    .transition(.opacity)
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(Text(T("Brightness")))
-                    .accessibilityValue(Text(verbatim: PhonePlayerTouch.percent(brightness.level)))
-                    .accessibilityIdentifier("player-brightness-pill")
+                    PhonePlayerBrightnessFace(player: self)
+                        .foregroundStyle(Color.white)
+                        .padding(.horizontal, 24)
+                        .frame(height: 46)
+                        .glassEffect(.regular, in: .capsule)
+                        .transition(.opacity)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(Text(T("Brightness")))
+                        .accessibilityValue(Text(verbatim: PhonePlayerTouch.percent(brightness.level)))
+                        .accessibilityIdentifier("player-brightness-pill")
                 }
                 if holding {
-                    HStack(spacing: 6) {
-                        Image(systemName: "forward.fill").font(.system(size: 13, weight: .semibold)).accessibilityHidden(true)
-                        Text(verbatim: String(format: "%gx", PhonePlayerTouch.holdRate)).font(.system(size: 16, weight: .semibold))
-                    }
-                    .foregroundStyle(Color.white)
-                    .padding(.horizontal, 16)
-                    .frame(height: 36)
-                    .glassEffect(.regular, in: .capsule)
-                    .transition(.opacity)
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(Text(T("Playing at 2x")))
-                    .accessibilityIdentifier("player-rate-pill")
+                    PhoneRateFace()
+                        .foregroundStyle(Color.white)
+                        .padding(.horizontal, 16)
+                        .frame(height: 36)
+                        .glassEffect(.regular, in: .capsule)
+                        .transition(.opacity)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(Text(T("Playing at 2x")))
+                        .accessibilityIdentifier("player-rate-pill")
                 }
             }
             .padding(.top, 17)
             Spacer()
         }
         .allowsHitTesting(false)
+    }
+
+    /// The brightness pill's sun and percent.
+    fileprivate var brightnessFace: some View {
+        HStack(spacing: 22) {
+            Image(systemName: "sun.max").font(.system(size: 25, weight: .regular)).accessibilityHidden(true)
+            Text(verbatim: PhonePlayerTouch.percent(brightness.level))
+                .font(.system(size: 15, weight: .medium)).monospacedDigit()
+                .frame(minWidth: 38, alignment: .leading)
+        }
+    }
+}
+
+// MARK: the HUD's parts (views of their own, a13: see PhonePlayerView.body)
+
+struct PhonePlayerHUDLayer: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.hud }
+}
+
+struct PhonePlayerTopRow: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.topRow }
+}
+
+struct PhonePlayerVolumeAlone: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.volumeAlone }
+}
+
+struct PhonePlayerVolumeCapsule: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.volumeCapsule }
+}
+
+struct PhonePlayerVolumeBar: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.volumeBar }
+}
+
+struct PhonePlayerTransport: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.transport }
+}
+
+struct PhonePlayerBottomBlock: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.bottomBlock }
+}
+
+struct PhonePlayerScrubber: View {
+    let player: PhonePlayerView
+    let clock: PlayerClock
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.scrubber(clock) }
+}
+
+struct PhonePlayerScrubTrack: View {
+    let player: PhonePlayerView
+    let duration: Double
+    let played: CGFloat
+    let buffered: CGFloat
+    let bar: CGFloat
+    let dragging: Bool
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.scrubTrack(duration: duration, played: played, buffered: buffered, bar: bar, dragging: dragging) }
+}
+
+struct PhonePlayerTopPills: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.topPills }
+}
+
+struct PhonePlayerBrightnessFace: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.brightnessFace }
+}
+
+/// The "2x" pill's arrow and rate.
+struct PhoneRateFace: View {
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "forward.fill").font(.system(size: 13, weight: .semibold)).accessibilityHidden(true)
+            Text(verbatim: String(format: "%gx", PhonePlayerTouch.holdRate)).font(.system(size: 16, weight: .semibold))
+        }
+    }
+}
+
+/// The transport's plain white icon (back, play / pause, ahead).
+struct PhonePlainIcon: View {
+    let id: String
+    let icon: String
+    let label: String
+    let size: CGFloat
+    let press: () -> Void
+
+    var body: some View {
+        Button { press() } label: {
+            Image(systemName: icon)
+                .font(.system(size: size, weight: .regular))
+                .foregroundStyle(Color.white)
+                .shadow(color: Color.black.opacity(0.35), radius: 6)
+                .frame(width: PhonePlayerView.Metrics.transportGap, height: 72)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text(label))
+        .accessibilityIdentifier(id)
+    }
+}
+
+/// An icon in a glass capsule.
+struct PhoneCapsuleIcon: View {
+    let id: String
+    let icon: String
+    let label: String
+    let size: CGFloat
+    let press: () -> Void
+
+    var body: some View {
+        Button { press() } label: {
+            Image(systemName: icon)
+                .font(.system(size: size, weight: .regular))
+                .foregroundStyle(Color.white)
+                .frame(width: 43, height: PhonePlayerView.Metrics.control)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text(label))
+        .accessibilityIdentifier(id)
     }
 }
 

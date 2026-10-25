@@ -133,7 +133,9 @@ jobs:
           xcodebuild -project Harbor.xcodeproj -scheme HarborPhone -destination "id=$udid" \
             -derivedDataPath build -clonedSourcePackagesDirPath spm -only-testing:HarborPhoneTests \
             CODE_SIGNING_ALLOWED=NO test-without-building > test.log 2>&1 \
-            || { grep -E "error:|failed|XCTAssert" test.log | head -80; tail -40 test.log; exit 1; }
+            || { grep -E "\[type-depth\]" test.log || true; grep -E "error:|failed|XCTAssert" test.log | head -80; tail -40 test.log; exit 1; }
+          # How deep the player's view types nest and the stack each takes to resolve (PhoneViewTypeDepthTests)
+          grep -E "\[type-depth\]" test.log || true
           grep -E "Executed [0-9]+ tests" test.log | tail -1
       - name: Home hero screenshots
         # The Home hero on the fixture feed with real art, from the UI test that attaches them, on the 6.9" iPhone

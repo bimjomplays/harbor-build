@@ -104,7 +104,21 @@ struct PhonePlayerView: View {
     /// being pulled down.
     var hudUp: Bool { (session.chromeShown || menuOpen) && session.panel == nil && local == nil && lock.passesTouches && pull < 1 }
 
+    /// The body is split into views of their own (PhonePlayerLayers and the parts it draws) and modifiers
+    /// of their own (look, lifecycle, presentation, motion), so no one view type nests deep: the first
+    /// draw resolves each body's static type on the main thread's stack, and the whole player as one
+    /// type (about 70 levels of generics) overflowed the iPhone's 1 MB there (a13). The parts hold a
+    /// copy of this view and draw its members; the state stays here.
     var body: some View {
+        PhonePlayerLayers(player: self)
+            .modifier(PhonePlayerLook(player: self))
+            .modifier(PhonePlayerLifecycle(player: self))
+            .modifier(PhonePlayerPresentation(player: self))
+            .modifier(PhonePlayerMotion(player: self))
+    }
+
+    /// Everything on screen, back to front.
+    var layers: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             engineLayer
@@ -117,107 +131,127 @@ struct PhonePlayerView: View {
             stage
             if let f = flash { PhoneSeekRipple(flash: f).id(f.id).allowsHitTesting(false) }
             if hudUp {
-                hud.transition(.opacity)
+                PhonePlayerHUDLayer(player: self).transition(.opacity)
             } else if levelShown == .volume, lock.passesTouches {
                 // A volume swipe with the HUD away shows the volume capsule on its own.
-                volumeAlone.transition(.opacity)
+                PhonePlayerVolumeAlone(player: self).transition(.opacity)
             }
-            topPills
+            PhonePlayerTopPills(player: self)
             // The cues follow the playhead: drawn in a leaf that observes the clock (the TV's cueLayer).
-            PlayerClockReader(session.clock) { _ in cueLayer }
-            if lock.locked { lockLayer.transition(.opacity) }
-            if let sec = session.resumePending { resumeCard(sec).transition(.opacity) }
-            if session.leaveConfirm { leaveCard.transition(.opacity) }
-            if session.failed, !session.isLive, session.resumePending == nil, !session.leaveConfirm { errorCard.transition(.opacity) }
-            if session.connectingShown { connectingCard.transition(.opacity) }
-            if session.kidsLoading { kidsLoader.transition(.opacity) }
+            PlayerClockReader(session.clock) { _ in PhonePlayerCues(player: self) }
+            if lock.locked { PhonePlayerLockLayer(player: self).transition(.opacity) }
+            if let sec = session.resumePending { PhonePlayerResumeCard(player: self, sec: sec).transition(.opacity) }
+            if session.leaveConfirm { PhonePlayerLeaveCard(player: self).transition(.opacity) }
+            if session.failed, !session.isLive, session.resumePending == nil, !session.leaveConfirm { PhonePlayerErrorCard(player: self).transition(.opacity) }
+            if session.connectingShown { PhonePlayerConnectingCard(player: self).transition(.opacity) }
+            if session.kidsLoading { PhonePlayerKidsLoader(player: self).transition(.opacity) }
             if session.noAudioWarning, session.engine == .native, !session.leaveConfirm, session.resumePending == nil, !session.failed {
-                noAudioCard.transition(.opacity)
+                PhonePlayerNoAudioCard(player: self).transition(.opacity)
             }
-            if session.pipActive, !hoisted, !session.stillPrompt { pipPlacard.transition(.opacity) }
-            if let note = session.backgroundNote, !session.pipActive { backgroundPill(note).transition(.opacity) }
+            if session.pipActive, !hoisted, !session.stillPrompt { PhonePlayerPiPPlacard(player: self).transition(.opacity) }
+            if let note = session.backgroundNote, !session.pipActive { PhonePlayerBackgroundPill(player: self, note: note).transition(.opacity) }
             if session.stillPrompt {
                 PhoneStillWatching(show: session.context?.meta.name ?? session.title, nextLabel: stillWatchingNextLabel,
                                    onContinue: { session.continueWatching() }, onExit: { session.stopWatching() })
                     .transition(.opacity)
             }
         }
-        // The player is always dark: the picture is under every part of it.
-        .environment(\.colorScheme, .dark)
-        .accessibilityElement(children: .contain)
-        // "player-screen" means the player is up; a floating one is out of sight and out of the tree.
-        .accessibilityIdentifier(floating ? "player-floating" : "player-screen")
-        // Over the root the shell is still in the tree: VoiceOver stays on the player.
-        .accessibilityAddTraits(hoisted && !floating ? .isModal : [])
-        .statusBarHidden(!floating)
-        .persistentSystemOverlays(floating ? .automatic : .hidden)
-        .opacity(floating ? 0 : 1)
-        .allowsHitTesting(!floating)
-        .accessibilityHidden(floating)
-        .onChange(of: session.chromeShown) { _, up in session.chromeShownChanged(to: up) }
-        .onChange(of: session.leaveConfirm) { _, up in session.leaveConfirmChanged(to: up) }
-        .onAppear {
-            PhoneOrientation.lock(.landscape)
-            PhonePlayerSystem.activateAudioSession()
-            session.appeared()
-        }
-        .onDisappear {
-            preview.close()
-            session.disappeared()
-            PhoneMiniState.shared.clear()
-            DisplayAwake.shared.hold(awake, awake: false)
-            brightness.restore()
-            PhoneOrientation.lock(.portrait)
-        }
-        .onReceive(CurfewState.shared.$locked) { session.curfewChanged($0) }
-        // Leaving the app saves the spot at once (the session's pagehide save) and the sound goes on;
-        // coming back, the HUD shows the film where it is, and a torrent that stopped says so. The
-        // phone's own brightness comes back while Harbor is away.
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
-            brightness.restore()
-            preview.close()
-            session.didEnterBackground()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in preview.trim() }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in session.willEnterForeground() }
-        .onChange(of: session.pipActive) { _, on in pipChanged(on) }
-        .confirmationDialog(T("Picture in Picture and AirPlay"), isPresented: Binding(get: { offer != nil }, set: { if !$0 { offer = nil } }),
-                            titleVisibility: .visible, presenting: offer) { feature in
-            Button(PhonePlayerSystem.offerButton(for: feature)) { session.switchToNative() }
-                .accessibilityIdentifier("player-switch-engine")
-            Button(role: .cancel) {} label: { Text(T("Cancel")) }
-        } message: { feature in
-            Text(verbatim: PhonePlayerSystem.offerMessage(for: feature))
-        }
-        .task { await session.start() }
-        .onReceive(tick) { _ in
-            session.tick()
-            if session.chromeShown { refreshPicks() }
-        }
-        .sheet(item: panelBinding) { p in
-            PhonePanelSheet(panel: p, session: session, source: currentSource, onClose: dismissPanel)
-        }
-        .onChange(of: session.status.state) { _, state in
-            session.statusChanged(to: state)
-            holdAwake()
-        }
-        .onChange(of: session.isPaused) { _, paused in
-            if !paused { session.backgroundNote = nil }
-            session.pausedChanged(to: paused)
-            if paused, holding { endHold() }
-            holdAwake()
-        }
-        .onChange(of: session.reloadToken) { _, _ in
-            preview.close()
-            session.reloadTokenChanged()
-        }
-        .onChange(of: session.pendingSeek) { old, new in scrubMoved(from: old, to: new) }
-        .motion(.easeOut(duration: 0.25), value: session.chrome)
-        .motion(.easeOut(duration: 0.25), value: session.leaveConfirm)
-        .motion(.easeOut(duration: 0.2), value: lock.locked)
-        .motion(.easeOut(duration: 0.2), value: lock.hintShown)
-        .motion(.easeOut(duration: 0.2), value: levelShown)
-        .motion(.easeOut(duration: 0.2), value: holding)
+    }
+
+    /// The player's look and its place for VoiceOver.
+    func look(_ content: some View) -> some View {
+        content
+            // The player is always dark: the picture is under every part of it.
+            .environment(\.colorScheme, .dark)
+            .accessibilityElement(children: .contain)
+            // "player-screen" means the player is up; a floating one is out of sight and out of the tree.
+            .accessibilityIdentifier(floating ? "player-floating" : "player-screen")
+            // Over the root the shell is still in the tree: VoiceOver stays on the player.
+            .accessibilityAddTraits(hoisted && !floating ? .isModal : [])
+            .statusBarHidden(!floating)
+            .persistentSystemOverlays(floating ? .automatic : .hidden)
+            .opacity(floating ? 0 : 1)
+            .allowsHitTesting(!floating)
+            .accessibilityHidden(floating)
+    }
+
+    /// Coming and going: the player's own, the app's (background, foreground, memory) and the curfew's.
+    func lifecycle(_ content: some View) -> some View {
+        content
+            .onChange(of: session.chromeShown) { _, up in session.chromeShownChanged(to: up) }
+            .onChange(of: session.leaveConfirm) { _, up in session.leaveConfirmChanged(to: up) }
+            .onAppear {
+                PhoneOrientation.lock(.landscape)
+                PhonePlayerSystem.activateAudioSession()
+                session.appeared()
+            }
+            .onDisappear {
+                preview.close()
+                session.disappeared()
+                PhoneMiniState.shared.clear()
+                DisplayAwake.shared.hold(awake, awake: false)
+                brightness.restore()
+                PhoneOrientation.lock(.portrait)
+            }
+            .onReceive(CurfewState.shared.$locked) { session.curfewChanged($0) }
+            // Leaving the app saves the spot at once (the session's pagehide save) and the sound goes on;
+            // coming back, the HUD shows the film where it is, and a torrent that stopped says so. The
+            // phone's own brightness comes back while Harbor is away.
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+                brightness.restore()
+                preview.close()
+                session.didEnterBackground()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in preview.trim() }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in session.willEnterForeground() }
+            .onChange(of: session.pipActive) { _, on in pipChanged(on) }
+    }
+
+    /// The engine offer, the session's start and tick, the panel sheet and the session's changes.
+    func presentation(_ content: some View) -> some View {
+        content
+            .confirmationDialog(T("Picture in Picture and AirPlay"), isPresented: Binding(get: { offer != nil }, set: { if !$0 { offer = nil } }),
+                                titleVisibility: .visible, presenting: offer) { feature in
+                Button(PhonePlayerSystem.offerButton(for: feature)) { session.switchToNative() }
+                    .accessibilityIdentifier("player-switch-engine")
+                Button(role: .cancel) {} label: { Text(T("Cancel")) }
+            } message: { feature in
+                Text(verbatim: PhonePlayerSystem.offerMessage(for: feature))
+            }
+            .task { await session.start() }
+            .onReceive(tick) { _ in
+                session.tick()
+                if session.chromeShown { refreshPicks() }
+            }
+            .sheet(item: panelBinding) { p in
+                PhonePanelSheet(panel: p, session: session, source: currentSource, onClose: dismissPanel)
+            }
+            .onChange(of: session.status.state) { _, state in
+                session.statusChanged(to: state)
+                holdAwake()
+            }
+            .onChange(of: session.isPaused) { _, paused in
+                if !paused { session.backgroundNote = nil }
+                session.pausedChanged(to: paused)
+                if paused, holding { endHold() }
+                holdAwake()
+            }
+            .onChange(of: session.reloadToken) { _, _ in
+                preview.close()
+                session.reloadTokenChanged()
+            }
+            .onChange(of: session.pendingSeek) { old, new in scrubMoved(from: old, to: new) }
+    }
+
+    /// The animations of the HUD, the cards, the lock and the pills.
+    func motions(_ content: some View) -> some View {
+        content
+            .motion(.easeOut(duration: 0.25), value: session.chrome)
+            .motion(.easeOut(duration: 0.25), value: session.leaveConfirm)
+            .motion(.easeOut(duration: 0.2), value: lock.locked)
+            .motion(.easeOut(duration: 0.2), value: lock.hintShown)
+            .motion(.easeOut(duration: 0.2), value: levelShown)
+            .motion(.easeOut(duration: 0.2), value: holding)
     }
 
     /// The idle timer is off only while the video plays (§2.7): paused, loading or failed, the phone
@@ -702,3 +736,66 @@ struct PhonePlayerView: View {
 
 /// The DisplayAwake holder of one phone player (the table holds it weakly).
 final class PhoneAwakeToken {}
+
+// MARK: the player's parts (a13)
+
+/// A number new for every part built, so a part always draws again when the view that builds it does
+/// (as the one body did): a part holds the player by value, and the objects in it stay the same object
+/// when they publish, so SwiftUI could take a rebuilt part for the old one and skip it.
+enum PhonePlayerPass {
+    nonisolated(unsafe) private static var last = 0
+
+    static func next() -> Int {
+        last &+= 1
+        return last
+    }
+}
+
+struct PhonePlayerLayers: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.layers }
+}
+
+struct PhonePlayerLook: ViewModifier {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    func body(content: Content) -> some View { player.look(content) }
+}
+
+struct PhonePlayerLifecycle: ViewModifier {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    func body(content: Content) -> some View { player.lifecycle(content) }
+}
+
+struct PhonePlayerPresentation: ViewModifier {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    func body(content: Content) -> some View { player.presentation(content) }
+}
+
+struct PhonePlayerMotion: ViewModifier {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    func body(content: Content) -> some View { player.motions(content) }
+}
+
+struct PhonePlayerLockLayer: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.lockLayer }
+}
+
+struct PhonePlayerPiPPlacard: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.pipPlacard }
+}
+
+struct PhonePlayerBackgroundPill: View {
+    let player: PhonePlayerView
+    let note: String
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.backgroundPill(note) }
+}

@@ -11,9 +11,9 @@ extension PhonePlayerView {
     @ViewBuilder var cueLayer: some View {
         if !session.leaveConfirm, session.resumePending == nil, !session.pipActive, !session.stillPrompt, !session.failed {
             if session.showUpNextCard, let upNext = session.upNext {
-                upNextCard(upNext).slideOrFade(.trailing)
+                PhonePlayerUpNext(player: self, text: upNext).slideOrFade(.trailing)
             } else if let seg = session.activeSkip {
-                skipPill(seg).slideOrFade(.trailing)
+                PhonePlayerSkipPill(player: self, seg: seg).slideOrFade(.trailing)
             }
         }
     }
@@ -21,7 +21,7 @@ extension PhonePlayerView {
     /// Above the scrubber while the HUD is up, near the corner when it is not.
     private var cueBottom: CGFloat { session.chrome ? 104 : 24 }
 
-    private func skipPill(_ seg: PlayerSession.SkipSegment) -> some View {
+    fileprivate func skipPill(_ seg: PlayerSession.SkipSegment) -> some View {
         let outroNext: Bool = session.isOutroNext(seg)
         // bp-skip-pill onDismiss: a real segment's pill carries a ✕ ("Hide this Skip button").
         let dismissKey: String? = session.displaySkip != nil && !outroNext ? session.skipButtonKey : nil
@@ -65,95 +65,62 @@ extension PhonePlayerView {
     }
 
     /// bp-up-next.tsx BpUpNext: the next episode, a countdown ring, "Play now" and "Keep watching".
-    private func upNextCard(_ text: String) -> some View {
+    fileprivate func upNextCard(_ text: String) -> some View {
+        VStack {
+            Spacer()
+            HStack {
+                Spacer()
+                PhonePlayerUpNextPlate(player: self, text: text)
+            }
+            .padding(.bottom, cueBottom).padding(.trailing, PhoneTheme.margin)
+        }
+    }
+
+    /// The up-next card's glass plate: the heading, the ring and the two buttons.
+    fileprivate func upNextPlate(_ text: String) -> some View {
         let seconds: Int = Int(session.remainingSec.rounded(.up))
         let progress: Double = session.leadSec > 0 ? min(1, max(0, 1 - Double(seconds) / session.leadSec)) : 0
         let parts: [String] = text.components(separatedBy: " · ")
         let epLabel: String = parts.first ?? text
         let name: String = parts.dropFirst().joined(separator: " · ")
         let heading: String = name.isEmpty ? epLabel : name
-        return VStack {
-            Spacer()
-            HStack {
-                Spacer()
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(alignment: .top) {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(T("Up Next")).font(PhoneTheme.sans(11.5, .bold, relativeTo: .caption)).textCase(.uppercase).tracking(1.4)
-                                .foregroundStyle(Color.white.opacity(0.6))
-                            Text(verbatim: heading).font(PhoneTheme.display(18, relativeTo: .headline)).foregroundStyle(Color.white).lineLimit(2)
-                            if heading != epLabel {
-                                Text(verbatim: epLabel).font(PhoneTheme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Color.white.opacity(0.6)).lineLimit(1)
-                            }
-                        }
-                        Spacer(minLength: 10)
-                        countdownRing(seconds: seconds, progress: progress)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(T("Up Next")).font(PhoneTheme.sans(11.5, .bold, relativeTo: .caption)).textCase(.uppercase).tracking(1.4)
+                        .foregroundStyle(Color.white.opacity(0.6))
+                    Text(verbatim: heading).font(PhoneTheme.display(18, relativeTo: .headline)).foregroundStyle(Color.white).lineLimit(2)
+                    if heading != epLabel {
+                        Text(verbatim: epLabel).font(PhoneTheme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Color.white.opacity(0.6)).lineLimit(1)
                     }
-                    HStack(spacing: 8) {
-                        cardButton("upnext-play", "Play now", "play.fill", primary: true) { session.playNext() }
-                        cardButton("upnext-keep", "Keep watching", "xmark") { session.cancelAutoNext() }
-                    }
-                    .padding(.top, 4)
                 }
-                .padding(16)
-                .frame(width: 340, alignment: .leading)
-                .phoneGlassPlate(radius: PhoneTheme.radiusLarge)
-                .accessibilityElement(children: .contain)
-                .accessibilityIdentifier("player-upnext")
+                Spacer(minLength: 10)
+                PhoneCountdownRing(seconds: seconds, progress: progress)
             }
-            .padding(.bottom, cueBottom).padding(.trailing, PhoneTheme.margin)
+            HStack(spacing: 8) {
+                cardButton("upnext-play", "Play now", "play.fill", primary: true) { session.playNext() }
+                cardButton("upnext-keep", "Keep watching", "xmark") { session.cancelAutoNext() }
+            }
+            .padding(.top, 4)
         }
-    }
-
-    /// bp-up-next.tsx CountdownRing: whole seconds left, the ring filling toward the jump.
-    private func countdownRing(seconds: Int, progress: Double) -> some View {
-        ZStack {
-            Circle().stroke(Color.white.opacity(0.2), lineWidth: 3).accessibilityHidden(true)
-            Circle().trim(from: 0, to: progress)
-                .stroke(BP.accent, style: StrokeStyle(lineWidth: 3, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-                .accessibilityHidden(true)
-            Text(verbatim: "\(seconds)").font(PhoneTheme.sans(14, .bold, relativeTo: .footnote)).foregroundStyle(Color.white).monospacedDigit()
-        }
-        .frame(width: 40, height: 40)
-        .motion(.linear(duration: 0.2), value: progress)
+        .padding(16)
+        .frame(width: 340, alignment: .leading)
+        .phoneGlassPlate(radius: PhoneTheme.radiusLarge)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("player-upnext")
     }
 
     // MARK: cards
 
     /// A card's button: glass, or the accent's prominent glass for the one the card leads with.
-    @ViewBuilder func cardButton(_ id: String, _ title: String, _ icon: String, primary: Bool = false, action: @escaping () -> Void) -> some View {
-        let label = Label(T(title), systemImage: icon)
-            .font(PhoneTheme.sans(15, .semibold, relativeTo: .subheadline))
-            .lineLimit(1)
-            .minimumScaleFactor(0.8)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 3)
-        if primary {
-            Button(action: action) { label }
-                .buttonStyle(.glassProminent)
-                .tint(BP.accent)
-                .accessibilityIdentifier(id)
-        } else {
-            Button(action: action) { label }
-                .buttonStyle(.glass)
-                .accessibilityIdentifier(id)
-        }
+    func cardButton(_ id: String, _ title: String, _ icon: String, primary: Bool = false, action: @escaping () -> Void) -> PhoneCardButton {
+        PhoneCardButton(id: id, title: title, icon: icon, primary: primary, action: action)
     }
 
-    /// A card centred over the dimmed picture.
+    /// A card centred over the dimmed picture (the plate is PhoneCardFrame).
     func card<Content: View>(_ id: String, width: CGFloat = 420, dim: Double = 0.55, @ViewBuilder _ content: () -> Content) -> some View {
-        ZStack {
-            Color.black.opacity(dim).ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 10) { content() }
-                .foregroundStyle(Color.white)
-                .padding(20)
-                .frame(maxWidth: width, alignment: .leading)
-                .phoneGlassPlate(radius: PhoneTheme.radiusLarge)
-                .padding(PhoneTheme.margin)
-                .accessibilityElement(children: .contain)
-                .accessibilityIdentifier(id)
-        }
+        VStack(alignment: .leading, spacing: 10) { content() }
+            .modifier(PhoneCardFrame(id: id, width: width, dim: dim))
     }
 
     private func cardTitle(_ text: String) -> some View {
@@ -169,14 +136,14 @@ extension PhonePlayerView {
 
     /// bp-resume-prompt.tsx: a fork over the paused first frame (settings.resumePrompt).
     func resumeCard(_ sec: Double) -> some View {
-        PlayerClockReader(session.clock) { c in resumeFork(sec, duration: c.snap.duration) }
+        PlayerClockReader(session.clock) { c in PhonePlayerResumeFork(player: self, sec: sec, duration: c.snap.duration) }
             .onAppear {
                 session.controller?.setPaused(true)
                 if let c = session.controller { session.takeSnap(c.snapshot()) }
             }
     }
 
-    private func resumeFork(_ sec: Double, duration: Double) -> some View {
+    fileprivate func resumeFork(_ sec: Double, duration: Double) -> some View {
         let head: String = session.title + (session.subtitle.map { " · " + $0 } ?? "")
         let at: String = duration > 0 ? T("%@ of %@", PlayerClock.fmt(sec), PlayerClock.fmt(duration)) : PlayerClock.fmt(sec)
         return card("player-resume-card") {
@@ -336,6 +303,148 @@ extension PhonePlayerView {
             .accessibilityIdentifier("player-noaudio")
         }
         .frame(maxWidth: .infinity)
+    }
+}
+
+// MARK: the cards' parts (views of their own, a13: see PhonePlayerView.body)
+
+struct PhonePlayerCues: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.cueLayer }
+}
+
+struct PhonePlayerSkipPill: View {
+    let player: PhonePlayerView
+    let seg: PlayerSession.SkipSegment
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.skipPill(seg) }
+}
+
+struct PhonePlayerUpNext: View {
+    let player: PhonePlayerView
+    let text: String
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.upNextCard(text) }
+}
+
+struct PhonePlayerUpNextPlate: View {
+    let player: PhonePlayerView
+    let text: String
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.upNextPlate(text) }
+}
+
+struct PhonePlayerResumeCard: View {
+    let player: PhonePlayerView
+    let sec: Double
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.resumeCard(sec) }
+}
+
+struct PhonePlayerResumeFork: View {
+    let player: PhonePlayerView
+    let sec: Double
+    let duration: Double
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.resumeFork(sec, duration: duration) }
+}
+
+struct PhonePlayerLeaveCard: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.leaveCard }
+}
+
+struct PhonePlayerErrorCard: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.errorCard }
+}
+
+struct PhonePlayerConnectingCard: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.connectingCard }
+}
+
+struct PhonePlayerKidsLoader: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.kidsLoader }
+}
+
+struct PhonePlayerNoAudioCard: View {
+    let player: PhonePlayerView
+    let pass = PhonePlayerPass.next()
+    var body: some View { player.noAudioCard }
+}
+
+/// bp-up-next.tsx CountdownRing: whole seconds left, the ring filling toward the jump.
+struct PhoneCountdownRing: View {
+    let seconds: Int
+    let progress: Double
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(Color.white.opacity(0.2), lineWidth: 3).accessibilityHidden(true)
+            Circle().trim(from: 0, to: progress)
+                .stroke(BP.accent, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .accessibilityHidden(true)
+            Text(verbatim: "\(seconds)").font(PhoneTheme.sans(14, .bold, relativeTo: .footnote)).foregroundStyle(Color.white).monospacedDigit()
+        }
+        .frame(width: 40, height: 40)
+        .motion(.linear(duration: 0.2), value: progress)
+    }
+}
+
+/// A card's button: glass, or the accent's prominent glass for the one the card leads with.
+struct PhoneCardButton: View {
+    let id: String
+    let title: String
+    let icon: String
+    var primary = false
+    let action: () -> Void
+
+    var body: some View {
+        let label = Label(T(title), systemImage: icon)
+            .font(PhoneTheme.sans(15, .semibold, relativeTo: .subheadline))
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 3)
+        if primary {
+            Button(action: action) { label }
+                .buttonStyle(.glassProminent)
+                .tint(BP.accent)
+                .accessibilityIdentifier(id)
+        } else {
+            Button(action: action) { label }
+                .buttonStyle(.glass)
+                .accessibilityIdentifier(id)
+        }
+    }
+}
+
+/// A card centred over the dimmed picture: the plate around the card's column.
+struct PhoneCardFrame: ViewModifier {
+    let id: String
+    let width: CGFloat
+    let dim: Double
+
+    func body(content: Content) -> some View {
+        ZStack {
+            Color.black.opacity(dim).ignoresSafeArea()
+            content
+                .foregroundStyle(Color.white)
+                .padding(20)
+                .frame(maxWidth: width, alignment: .leading)
+                .phoneGlassPlate(radius: PhoneTheme.radiusLarge)
+                .padding(PhoneTheme.margin)
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier(id)
+        }
     }
 }
 
