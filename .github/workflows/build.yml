@@ -136,14 +136,15 @@ jobs:
             || { grep -E "error:|failed|XCTAssert" test.log | head -80; tail -40 test.log; exit 1; }
           grep -E "Executed [0-9]+ tests" test.log | tail -1
       - name: Home hero screenshots
-        # The Home hero on the fixture feed with real art, from the UI test that attaches them. Informational: a
-        # simulator hiccup here must not hold back the TestFlight upload.
+        # The Home hero on the fixture feed with real art, from the UI test that attaches them, on the 6.9" iPhone
+        # (440 pt wide, shots 1320x2868) when the runner has it. Informational: a simulator hiccup here must not hold
+        # back the TestFlight upload.
         continue-on-error: true
         run: |
           udid=$(xcrun simctl list devices available -j | python3 -c '
           import json, sys
           devs = [d | {"rt": rt} for rt, ds in json.load(sys.stdin)["devices"].items() if "iOS" in rt for d in ds if d["name"].startswith("iPhone")]
-          devs.sort(key=lambda d: (d["rt"], d["name"] == "iPhone 17"))
+          devs.sort(key=lambda d: (d["rt"], d["name"] == "iPhone 17 Pro Max", d["name"] == "iPhone 17"))
           print(devs[-1]["udid"] if devs else "")')
           test -n "$udid" || exit 1
           xcrun simctl boot "$udid" || true

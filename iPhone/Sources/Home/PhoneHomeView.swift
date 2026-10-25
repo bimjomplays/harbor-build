@@ -433,7 +433,11 @@ struct PhoneHomeView: View {
 /// What `--phone-hero-demo` changes on Home's hero (PhoneLaunch.heroDemo): only under fixtures.
 @MainActor
 enum PhoneHomeDemo {
-    /// The lead's first title with real-looking copy and public art (Cinemeta's image host).
+    /// The lead's first title with real-looking copy and public art. The backdrop is the title's own TMDB
+    /// backdrop at the size the engine hands out (w780, 780x439: a landscape 16:9 picture, as every real hero's),
+    /// so the screenshots show how much of it the hero crops. The logo comes from Cinemeta's image host.
+    static let backdrop = "https://image.tmdb.org/t/p/w780/4NmCfWHzytiKM3riCMcbVYBJhlB.jpg"
+
     static func heroArt(_ lead: [Meta]) -> [Meta] {
         guard Fixtures.active, PhoneLaunch.heroDemo, var first = lead.first else { return lead }
         first.name = "Cyberpunk: Edgerunners"
@@ -442,7 +446,7 @@ enum PhoneHomeDemo {
         first.genres = ["Animation", "Sci-Fi"]
         let host = "https://images.metahub.space"
         let imdb = "tt" + "12590266"
-        first.background = "\(host)/background/large/\(imdb)/img"
+        first.background = backdrop
         first.logo = "\(host)/logo/large/\(imdb)/img"
         return [first] + lead.dropFirst()
     }
