@@ -104,7 +104,8 @@ final class PlayerShotTests: XCTestCase {
     }
 
     func testPlayerShots() {
-        let app = launchHarbor(["--fixtures", "detail", "--fixture-streams", "--phone-picker", "--phone-player-demo"])
+        let app = launchHarbor(["--fixtures", "detail", "--fixture-streams", "--phone-picker", "--phone-player-demo",
+                                "--fixture-hud-after", "600"])
         expect(app, "phone-picker", timeout: 40)
         tap(app, "stream-0", timeout: 30)
         expect(app, "player-screen", timeout: 20)
@@ -114,15 +115,16 @@ final class PlayerShotTests: XCTestCase {
         _ = element(app, "player-fixture-picture").waitForExistence(timeout: 25)
         pause(2)
 
-        // The HUD, playing.
+        // The HUD, playing. It stays until a tap (`--fixture-hud-after 600`): the element checks below are
+        // slow enough on CI to outlast the fixtures' usual 30 s.
         wakeHUD(app)
+        pause(1)
+        snap("01-hud-playing")
         for id in ["player-close", "player-fill", "player-volume", "player-back", "player-playpause", "player-ahead",
                    "player-title", "player-gear", "player-airplay", "player-lock", "player-scrubber", "player-elapsed", "player-remaining"] {
             expect(app, id, timeout: 5)
         }
         XCTAssertEqual(element(app, "player-volume").value as? String, "40%", "the volume capsule reads the fixture's level")
-        pause(1)
-        snap("01-hud-playing")
 
         // Paused.
         tap(app, "player-playpause", timeout: 5)

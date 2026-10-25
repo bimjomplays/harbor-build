@@ -28,8 +28,8 @@ extension PhonePlayerView {
     var hud: some View {
         ZStack {
             // A light dim over the picture, deeper at the foot under the title and the bar.
-            LinearGradient(stops: [.init(color: Color.black.opacity(0.32), location: 0), .init(color: Color.black.opacity(0.14), location: 0.3),
-                                   .init(color: Color.black.opacity(0.14), location: 0.55), .init(color: Color.black.opacity(0.62), location: 1)],
+            LinearGradient(stops: [.init(color: Color.black.opacity(0.22), location: 0), .init(color: Color.black.opacity(0.06), location: 0.25),
+                                   .init(color: Color.black.opacity(0.06), location: 0.6), .init(color: Color.black.opacity(0.5), location: 1)],
                            startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
@@ -127,7 +127,7 @@ extension PhonePlayerView {
             .environment(\.layoutDirection, .leftToRight)
             Image(systemName: PhonePlayerTouch.speakerGlyph(level))
                 .font(.system(size: 17, weight: .regular))
-                .foregroundStyle(Color.white)
+                .foregroundStyle(Color.white.opacity(0.75))
                 .frame(width: 26, alignment: .leading)
                 .accessibilityHidden(true)
         }
