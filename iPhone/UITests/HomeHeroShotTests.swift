@@ -58,15 +58,4 @@ final class HomeHeroShotTests: XCTestCase {
         pause(1)
         snap("home-hero-scrolled")
     }
-
-    /// The hero art at each frame shape (`--phone-hero-art`): 16:9 is the whole backdrop, 4:3 the default, 1:1 the tallest.
-    func testHeroArtShapes() throws {
-        for (shape, name) in [("16:9", "16x9"), ("4:3", "4x3"), ("1:1", "1x1")] {
-            let app = launchHarbor(["--fixtures", "shell", "--phone-hero-demo", "--phone-hero-art", shape])
-            XCTAssertTrue(element(app, "hero-carousel").waitForExistence(timeout: 30), "no hero at \(shape)")
-            XCTAssertLessThanOrEqual(element(app, "hero-carousel").frame.minY, 1, "the hero does not start at the top at \(shape)")
-            pause(8)
-            snap("home-hero-art-\(name)")
-        }
-    }
 }

@@ -9,8 +9,11 @@ import SwiftUI
 /// The hero is `height` tall counting from the screen's top edge: Home shifts it up by the top safe area
 /// (PhoneHomeView), so the art starts at y = 0 and everything below is laid out as if it began there.
 struct PhoneHero: View {
-    /// The hero's share of the screen's height, and the least and most it takes (points).
-    static func height(forScreen screen: CGFloat) -> CGFloat { min(720, max(540, screen * 0.68)) }
+    /// The hero's share of the screen's height, and the least and most it takes (points). Short on purpose: the
+    /// art fills the whole hero, so a tall hero crops a landscape backdrop to a narrow middle slice. At about
+    /// 1.2x the screen's width (a bit taller than square) the art shows most of the picture, the text block
+    /// still fits under the floating buttons, and the art still runs to the top edge.
+    static func height(forScreen screen: CGFloat) -> CGFloat { min(580, max(440, screen * 0.56)) }
 
     let items: [Meta]
     /// "#1 in Top 10 Today" and the like, by title id: only titles that really rank get one.
@@ -115,10 +118,6 @@ struct PhoneHero: View {
 private struct PhoneHeroPage: View {
     /// The page's side margin: the mockup's 20, a little wider than the rails below.
     static let margin: CGFloat = 20
-    /// How much of the backdrop shows: the art fills a frame this shape (width over height) across the full
-    /// width from the top of the screen. 16:9 is the whole of a TMDB backdrop; 4:3 (the default) and 1:1 are
-    /// taller, so the art is bigger and the sides crop in. `--phone-hero-art 16:9|4:3|1:1` tries the others.
-    static var artAspect: CGFloat { PhoneLaunch.heroArtAspect ?? 4.0 / 3.0 }
 
     let meta: Meta
     let kicker: String?
@@ -176,37 +175,33 @@ private struct PhoneHeroPage: View {
         }
     }
 
-    /// The art with its scrims, edge to edge. It fills a frame of one set shape (`artAspect`, width over height)
-    /// that starts at the very top of the screen; below it the page is the canvas, and the art fades into that
-    /// along its lower part, behind the kicker, logo and buttons. Pulled past the top, everything grows from the
-    /// bottom edge so the top stays glued to the screen's.
+    /// The art with its scrims, edge to edge. Pulled past the top, it grows from its bottom edge so the
+    /// top stays glued to the screen's.
     private var art: some View {
-        ZStack(alignment: .top) {
-            BP.canvas
-            ZStack {
-                // No backdrop (or none yet): an accent wash instead of a dark hole.
-                LinearGradient(colors: [BP.accent.opacity(0.38), BP.surface], startPoint: .top, endPoint: .bottom)
-                PhoneImage(url: artURL, plate: false)
-                // The left side darkens under the text.
-                LinearGradient(colors: [BP.canvas.opacity(0.5), BP.canvas.opacity(0)], startPoint: .leading, endPoint: UnitPoint(x: 0.7, y: 0.5))
-                    .mask(LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: UnitPoint(x: 0.5, y: 0.6)))
-                // Into the canvas along the lower part of the art.
-                LinearGradient(stops: [.init(color: BP.canvas.opacity(0), location: 0.45),
-                                       .init(color: BP.canvas.opacity(0.35), location: 0.62),
-                                       .init(color: BP.canvas.opacity(0.75), location: 0.8),
-                                       .init(color: BP.canvas.opacity(0.95), location: 0.94),
-                                       .init(color: BP.canvas, location: 1)],
-                               startPoint: .top, endPoint: .bottom)
-            }
-            .aspectRatio(Self.artAspect, contentMode: .fit)
+        ZStack {
+            // No backdrop (or none yet): an accent wash instead of a dark hole.
+            LinearGradient(colors: [BP.accent.opacity(0.38), BP.surface], startPoint: .top, endPoint: .bottom)
+            PhoneImage(url: artURL, plate: false)
             // Status bar legibility: a soft scrim from the very top, fading out, not a bar.
-            LinearGradient(stops: [.init(color: .black.opacity(0.5), location: 0),
-                                   .init(color: .black.opacity(0.2), location: 0.55),
+            LinearGradient(stops: [.init(color: .black.opacity(0.55), location: 0),
+                                   .init(color: .black.opacity(0.22), location: 0.55),
                                    .init(color: .clear, location: 1)],
                            startPoint: .top, endPoint: .bottom)
-                .frame(height: 160)
+                .frame(height: 190)
+                .frame(maxHeight: .infinity, alignment: .top)
+            // The left side darkens under the text.
+            LinearGradient(colors: [BP.canvas.opacity(0.55), BP.canvas.opacity(0)], startPoint: .leading, endPoint: UnitPoint(x: 0.7, y: 0.5))
+                .mask(LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: UnitPoint(x: 0.5, y: 0.35)))
+                .frame(height: height * 0.5)
+                .frame(maxHeight: .infinity, alignment: .bottom)
+            // Into the canvas at the bottom.
+            LinearGradient(stops: [.init(color: BP.canvas.opacity(0), location: 0.38),
+                                   .init(color: BP.canvas.opacity(0.5), location: 0.56),
+                                   .init(color: BP.canvas.opacity(0.88), location: 0.76),
+                                   .init(color: BP.canvas, location: 0.98)],
+                           startPoint: .top, endPoint: .bottom)
         }
-        .frame(height: height, alignment: .top)
+        .frame(height: height)
         .clipped()
         .scaleEffect(1 + stretch / max(1, height), anchor: .bottom)
     }

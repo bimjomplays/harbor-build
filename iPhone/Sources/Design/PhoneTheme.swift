@@ -116,17 +116,6 @@ enum PhoneLaunch {
     /// facts, a "#1" kicker) so the Home hero can be screenshotted as it looks with art. The fixtures
     /// themselves carry none, and no screenshot should wait on the network for it.
     static var heroDemo: Bool { args.contains("--phone-hero-demo") }
-    /// `--phone-hero-art 16:9|4:3|1:1`: the shape of the frame Home's hero art fills (PhoneHeroPage.artAspect),
-    /// for comparing how much of the backdrop shows. Nil: the default.
-    static var heroArtAspect: CGFloat? {
-        guard let i = args.firstIndex(of: "--phone-hero-art"), i + 1 < args.count else { return nil }
-        switch args[i + 1] {
-        case "16:9": return 16.0 / 9.0
-        case "4:3": return 4.0 / 3.0
-        case "1:1": return 1
-        default: return nil
-        }
-    }
 
     /// `--phone-no-resume` (with `--fixtures`): Continue Watching comes back empty for the tab bar's
     /// Resume accessory, so its hidden state can be tested (the fixture feed always has two titles).
