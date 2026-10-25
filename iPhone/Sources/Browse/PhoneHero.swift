@@ -182,12 +182,19 @@ private struct PhoneHeroPage: View {
             LinearGradient(colors: [BP.accent.opacity(0.38), BP.surface], startPoint: .top, endPoint: .bottom)
             // The backdrop is 16:9 and the hero is much taller than that, so filling the hero would show only
             // a narrow middle slice. Instead: the picture sits at its own shape across the full width, top
-            // aligned (under the status bar), and fades out into a soft blur of itself that carries the colours
-            // down to the text and the canvas.
-            PhoneImage(url: artURL, plate: false, decodeScale: 0.2)
-                .scaleEffect(1.25)
-                .blur(radius: 36)
-                .overlay(Color.black.opacity(0.22))
+            // aligned (under the status bar), and fades out into a blurred mirror of its own bottom edge,
+            // which carries the picture's colours on down to the text and the canvas.
+            VStack(spacing: 0) {
+                PhoneImage(url: artURL, plate: false, decodeScale: 0.25)
+                    .aspectRatio(Self.artAspect, contentMode: .fit)
+                PhoneImage(url: artURL, plate: false, decodeScale: 0.25)
+                    .aspectRatio(Self.artAspect, contentMode: .fit)
+                    .scaleEffect(y: -1)
+            }
+            .frame(maxHeight: .infinity, alignment: .top)
+            .scaleEffect(x: 1.12, y: 1, anchor: .top)
+            .blur(radius: 24)
+            .overlay(Color.black.opacity(0.2))
             PhoneImage(url: artURL, plate: false)
                 .aspectRatio(Self.artAspect, contentMode: .fit)
                 .mask(LinearGradient(stops: [.init(color: .black, location: 0),
