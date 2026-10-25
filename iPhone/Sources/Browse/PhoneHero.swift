@@ -197,11 +197,12 @@ private struct PhoneHeroPage: View {
 
     /// The art band with its scrims, edge to edge across the top of the page, then the canvas: the whole page
     /// opens the title. Pulled past the top, the band grows from its bottom edge so its top stays glued to the
-    /// screen's.
+    /// screen's. The canvas under the band is solid: the screen's background has an accent glow at the top
+    /// (PhoneBackground) that would show as a seam where the band ends.
     private var art: some View {
         VStack(spacing: 0) {
             band
-            Color.clear
+            BP.canvas
         }
         .frame(height: height)
         .contentShape(Rectangle())
